@@ -1,0 +1,28 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs and local artifacts
+*.log
+lark-auth-qr.png
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,230 @@
+"""Entry point.
+
+Three ways to start, in order of preference for path 2 (external integration):
+
+    # (a) Another service already joined the meeting AND already fetched the WS URL.
+    #     Nothing else to do — we just attach the audio session.
+    python -m lark_meeting_voice --ws-url 'wss://...'
+
+    # (b) Another service already joined; pass meeting_id, we fetch the WS URL.
+    python -m lark_meeting_voice --meeting-id 7642440384966134751
+
+    # (c) Standalone: this process performs bots/join itself.
+    python -m lark_meeting_voice --meeting-no 123456789
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import ctypes
+import logging
+import os
+import signal
+import sys
+
+from lark_meeting_voice.agent.orchestrator import Orchestrator
+from lark_meeting_voice.config import CFG
+from lark_meeting_voice.lark.bot_join import (
+    LarkAPIError,
+    bot_join_meeting,
+    get_realtime_endpoint,
+)
+from lark_meeting_voice.lark.realtime import RealtimeClient
+
+
+def _setup_logging() -> None:
+    logging.basicConfig(
+        level=getattr(logging, CFG.agent.log_level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-7s %(name)s :: %(message)s",
+    )
+    logging.getLogger("websockets.client").setLevel(logging.WARNING)
+    logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
+
+def _install_parent_death_signal() -> None:
+    """Linux only: when the parent process dies, send us SIGTERM.
+
+    Prevents orphaned voice subprocesses if the parent process crashes / is killed,
+    which would otherwise keep the Bot stuck in the meeting.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        PR_SET_PDEATHSIG = 1  # noqa: N806
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        if libc.prctl(PR_SET_PDEATHSIG, signal.SIGTERM, 0, 0, 0) != 0:
+            err = ctypes.get_errno()
+            logging.warning("prctl(PR_SET_PDEATHSIG) failed: errno=%s", err)
+        else:
+            logging.info("Parent-death signal installed (SIGTERM on parent exit)")
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Could not install parent-death signal: %s", e)
+
+
+async def _resolve_ws_url(
+    *,
+    ws_url: str | None,
+    meeting_id: str | None,
+    meeting_no: str | None,
+) -> str:
+    if ws_url:
+        logging.info("Using ws-url supplied by caller")
+        return ws_url
+    if meeting_id:
+        logging.info(
+            "Fetching realtime endpoint for existing meeting_id=%s", meeting_id
+        )
+        return await get_realtime_endpoint(meeting_id)
+    assert meeting_no, "must provide one of --ws-url / --meeting-id / --meeting-no"
+    mid, _ = await bot_join_meeting(meeting_no)
+    return await get_realtime_endpoint(mid)
+
+
+async def _run(
+    *,
+    ws_url: str | None,
+    meeting_id: str | None,
+    meeting_no: str | None,
+) -> int:
+    CFG.validate(
+        require_feishu_access=not bool(ws_url),
+        require_feishu_user_token=bool(meeting_id or meeting_no),
+    )
+
+    stop_evt = asyncio.Event()
+
+    def _stop(*_args):
+        logging.info("Signal received, shutting down")
+        stop_evt.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _stop)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_: _stop())
+
+    max_attempts = max(1, CFG.agent.reconnect_attempts)
+    backoff_s = max(0.0, CFG.agent.reconnect_backoff_s)
+
+    for attempt in range(1, max_attempts + 1):
+        rt: RealtimeClient | None = None
+        orch_task: asyncio.Task | None = None
+        try:
+            resolved_ws_url = await _resolve_ws_url(
+                ws_url=ws_url,
+                meeting_id=meeting_id,
+                meeting_no=meeting_no,
+            )
+            rt = RealtimeClient(resolved_ws_url)
+            await rt.connect()
+            await rt.wait_session_created()
+            logging.info("Realtime session ready; entering orchestrator loop")
+
+            orch = Orchestrator(rt)
+            orch_task = asyncio.create_task(orch.run(), name=f"orchestrator-{attempt}")
+            stop_task = asyncio.create_task(
+                stop_evt.wait(), name=f"stop-wait-{attempt}"
+            )
+
+            done, pending = await asyncio.wait(
+                {orch_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+
+            if stop_task in done:
+                logging.info("Stop requested; exiting")
+                return 0
+
+            exc = orch_task.exception()
+            if exc is not None:
+                logging.error(
+                    "Orchestrator crashed on attempt %d/%d: %r",
+                    attempt,
+                    max_attempts,
+                    exc,
+                    exc_info=exc,
+                )
+            else:
+                logging.warning(
+                    "Realtime session ended unexpectedly on attempt %d/%d",
+                    attempt,
+                    max_attempts,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logging.error(
+                "Realtime session setup failed on attempt %d/%d: %r",
+                attempt,
+                max_attempts,
+                exc,
+                exc_info=exc,
+            )
+            if isinstance(exc, LarkAPIError) and not exc.retryable:
+                logging.error(
+                    "Non-retryable Lark API error code=%s; stop retrying", exc.code
+                )
+                return 1
+        finally:
+            if rt is not None:
+                await rt.close(reason="USER_LEFT")
+            if orch_task is not None:
+                orch_task.cancel()
+                try:
+                    await orch_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        if stop_evt.is_set() or attempt >= max_attempts:
+            break
+
+        delay = backoff_s * (2 ** (attempt - 1))
+        logging.warning(
+            "Retrying realtime session in %.1fs (attempt %d/%d)",
+            delay,
+            attempt + 1,
+            max_attempts,
+        )
+        await asyncio.sleep(delay)
+
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Lark Meeting Talk Agent — realtime Feishu meeting voice assistant"
+    )
+    grp = parser.add_mutually_exclusive_group(required=True)
+    grp.add_argument(
+        "--ws-url",
+        help="Realtime WebSocket URL returned by /vc/v1/realtime/endpoint. "
+        "Pass this when another service has already fetched it — skips one HTTP call.",
+    )
+    grp.add_argument(
+        "--meeting-id",
+        help="Already-joined meeting id (another service did the bots/join). "
+        "We will call realtime/endpoint ourselves to get the WS URL.",
+    )
+    grp.add_argument(
+        "--meeting-no",
+        help="Numeric meeting number. Use only if you want this process to do "
+        "bots/join itself (standalone / smoke-test mode).",
+    )
+    args = parser.parse_args()
+    _setup_logging()
+    _install_parent_death_signal()
+    return asyncio.run(
+        _run(
+            ws_url=args.ws_url,
+            meeting_id=args.meeting_id,
+            meeting_no=args.meeting_no,
+        )
+    )
+
+
+if __name__ == "__main__":
+    sys.exit(main())
