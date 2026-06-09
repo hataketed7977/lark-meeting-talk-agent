@@ -8,7 +8,7 @@ Behavior:
     - Explicit end-session words return the bot to WAITING.
 
 This module owns the state and wires together: RealtimeClient, VolcASR,
-DoubaoLLM, VolcTTS, WakeDetector, StopClassifier, PacedSender.
+OpenAICompatibleLLM, VolcTTS, WakeDetector, StopClassifier, PacedSender.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ from lark_meeting_voice.audio.resample import downsample_24k_to_16k
 from lark_meeting_voice.config import CFG
 from lark_meeting_voice.intent.stop_classifier import StopClassifier
 from lark_meeting_voice.lark.realtime import RealtimeClient
-from lark_meeting_voice.llm.doubao import DoubaoLLM, sentence_chunks
+from lark_meeting_voice.llm.openai_compatible import OpenAICompatibleLLM, sentence_chunks
 from lark_meeting_voice.memory.meeting_memory import MeetingMemory
 from lark_meeting_voice.tts.volc_tts import VolcTTS
 from lark_meeting_voice.wake.detector import WakeDetector
@@ -45,7 +45,7 @@ class Orchestrator:
         self._wake = WakeDetector(CFG.agent.wake_words)
         self._stop = StopClassifier(CFG.agent.stop_words)
         self._end_session = StopClassifier(CFG.agent.end_session_words)
-        self._llm = DoubaoLLM()
+        self._llm = OpenAICompatibleLLM()
         self._tts = VolcTTS()
         self._memory = MeetingMemory(
             max_recent_utterances=CFG.agent.memory_recent_utterances,

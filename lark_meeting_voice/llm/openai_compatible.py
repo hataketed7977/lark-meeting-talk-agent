@@ -1,4 +1,4 @@
-"""Doubao streaming LLM client (OpenAI-compatible Ark endpoint)."""
+"""OpenAI-compatible streaming LLM client."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from lark_meeting_voice.config import CFG
 log = logging.getLogger(__name__)
 
 
-class DoubaoLLM:
+class OpenAICompatibleLLM:
     def __init__(self) -> None:
         self._client = AsyncOpenAI(
             api_key=CFG.llm.api_key,

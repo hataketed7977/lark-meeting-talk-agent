@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lark-meeting-talk-agent"
+version = "0.1.0"
+description = "Realtime Feishu/Lark meeting voice agent with wake-word dialog and in-memory meeting memory."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+  { name = "Lark Meeting Talk Agent contributors" }
+]
+keywords = ["lark", "feishu", "meeting", "voice-agent", "asr", "tts", "openai-compatible"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+  "aiohttp>=3.9.5",
+  "websockets>=12.0",
+  "protobuf>=4.25.3",
+  "python-dotenv>=1.0.1",
+  "numpy>=1.26.4",
+  "scipy>=1.13.0",
+  "openai>=1.40.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+lark-meeting-talk-agent = "lark_meeting_voice.main:main"
+
+[tool.setuptools.packages.find]
+include = ["lark_meeting_voice*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

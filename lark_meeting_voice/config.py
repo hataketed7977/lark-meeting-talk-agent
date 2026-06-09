@@ -51,12 +51,12 @@ class ASRConfig:
 @dataclass
 class LLMConfig:
     base_url: str = os.getenv(
-        "DOUBAO_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
+        "LLM_BASE_URL", "https://ark.cn-beijing.volces.com/api/v3"
     )
-    api_key: str = os.getenv("DOUBAO_API_KEY", "")
-    model: str = os.getenv("DOUBAO_ENDPOINT_ID", "")
+    api_key: str = os.getenv("LLM_API_KEY", "")
+    model: str = os.getenv("LLM_MODEL", "")
     system_prompt: str = os.getenv(
-        "DOUBAO_SYSTEM_PROMPT",
+        "LLM_SYSTEM_PROMPT",
         (
             "You are James, a real-time meeting voice assistant. Reply in the user's "
             "language. Start with a direct one-sentence answer, then add at most "
@@ -66,12 +66,12 @@ class LLMConfig:
             "voice replies under 80 words unless the user asks for detail."
         ),
     )
-    max_history_turns: int = int(os.getenv("DOUBAO_MAX_HISTORY_TURNS", "8"))
+    max_history_turns: int = int(os.getenv("LLM_MAX_HISTORY_TURNS", "8"))
     meeting_context_max_chars: int = int(os.getenv("MEETING_CONTEXT_MAX_CHARS", "6000"))
-    max_tokens: int = int(os.getenv("DOUBAO_MAX_TOKENS", "220"))
-    request_timeout_s: float = float(os.getenv("DOUBAO_REQUEST_TIMEOUT_S", "20"))
+    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "220"))
+    request_timeout_s: float = float(os.getenv("LLM_REQUEST_TIMEOUT_S", "20"))
     stream_idle_timeout_s: float = float(
-        os.getenv("DOUBAO_STREAM_IDLE_TIMEOUT_S", "12")
+        os.getenv("LLM_STREAM_IDLE_TIMEOUT_S", "12")
     )
     tts_chunk_min_chars: int = int(os.getenv("LLM_TTS_CHUNK_MIN_CHARS", "6"))
     tts_chunk_max_chars: int = int(os.getenv("LLM_TTS_CHUNK_MAX_CHARS", "80"))
@@ -169,7 +169,7 @@ class Config:
         if not (self.asr.appid and self.asr.token):
             missing.append("VOLC_ASR_APPID / VOLC_ASR_TOKEN")
         if not (self.llm.api_key and self.llm.model):
-            missing.append("DOUBAO_API_KEY / DOUBAO_ENDPOINT_ID")
+            missing.append("LLM_API_KEY / LLM_MODEL")
         if not (self.tts.appid and self.tts.token):
             missing.append("VOLC_TTS_APPID / VOLC_TTS_TOKEN")
         if missing:
