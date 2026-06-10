@@ -34,6 +34,7 @@ class FeishuConfig:
 
 @dataclass
 class ASRConfig:
+    backend: str = os.getenv("VOLC_ASR_BACKEND", "sdk")
     appid: str = os.getenv("VOLC_ASR_APPID", "")
     token: str = os.getenv("VOLC_ASR_TOKEN", "")
     cluster: str = os.getenv("VOLC_ASR_CLUSTER", "volcengine_streaming_common")
@@ -123,7 +124,7 @@ class AgentConfig:
             )
         )
     )
-    engaged_idle_timeout_s: float = float(os.getenv("ENGAGED_IDLE_TIMEOUT_S", "60"))
+    engaged_idle_timeout_s: float = float(os.getenv("ENGAGED_IDLE_TIMEOUT_S", "0"))
     memory_recent_utterances: int = int(os.getenv("MEMORY_RECENT_UTTERANCES", "50"))
     memory_summary_items: int = int(os.getenv("MEMORY_SUMMARY_ITEMS", "8"))
     memory_context_recent_utterances: int = int(

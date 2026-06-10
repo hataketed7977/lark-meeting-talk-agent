@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import AsyncIterator, List
+from typing import AsyncIterator, Awaitable, Callable, List
 
 from openai import AsyncOpenAI
 
@@ -107,6 +107,7 @@ class OpenAICompatibleLLM:
         user_text: str,
         cancel_event: asyncio.Event,
         meeting_context: str | None = None,
+        on_complete: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> AsyncIterator[str]:
         """Stream assistant tokens. Yields text deltas.
 
@@ -182,6 +183,10 @@ class OpenAICompatibleLLM:
             if text and not cancel_event.is_set():
                 self._history.append({"role": "user", "content": user_text})
                 self._history.append({"role": "assistant", "content": text})
+                if on_complete is not None:
+                    maybe_awaitable = on_complete(text)
+                    if maybe_awaitable is not None:
+                        await maybe_awaitable
 
 
 # Helper: split a token stream into sentence-sized chunks for TTS pacing.

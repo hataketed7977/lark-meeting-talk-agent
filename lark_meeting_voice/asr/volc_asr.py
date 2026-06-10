@@ -36,6 +36,7 @@ import asyncio
 import gzip
 import json
 import logging
+import re
 import struct
 import uuid
 from typing import Any, Awaitable, Callable, Optional
@@ -137,6 +138,36 @@ def _as_bool(value: Any) -> bool:
     return False
 
 
+_ENGLISH_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "，": ",",
+        "。": ".",
+        "！": "!",
+        "？": "?",
+        "：": ":",
+        "；": ";",
+        "（": "(",
+        "）": ")",
+    }
+)
+
+
+def _looks_english(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text)) and not bool(
+        re.search(r"[\u4e00-\u9fff]", text)
+    )
+
+
+def _normalize_asr_text(text: str) -> str:
+    cleaned = " ".join((text or "").strip().split())
+    if not cleaned or not _looks_english(cleaned):
+        return cleaned
+    cleaned = cleaned.translate(_ENGLISH_PUNCT_TRANSLATION)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"([,.;:!?])([A-Za-z0-9])", r"\1 \2", cleaned)
+    return cleaned.strip()
+
+
 def _build_asr_start_request(req_id: str) -> dict[str, Any]:
     audio: dict[str, Any] = {
         "format": "pcm",
@@ -145,13 +176,14 @@ def _build_asr_start_request(req_id: str) -> dict[str, Any]:
         "bits": 16,
         "channel": 1,
     }
-    if not _is_v3_ws_url(CFG.asr.ws_url):
+    if CFG.asr.language:
         audio["language"] = CFG.asr.language
 
     request: dict[str, Any]
     if _is_v3_ws_url(CFG.asr.ws_url):
         request = {
             "model_name": "bigmodel",
+            "language": CFG.asr.language,
             "enable_itn": True,
             "enable_punc": True,
             "enable_ddc": False,
@@ -405,7 +437,7 @@ class VolcASR:
         else:
             log.debug("Ignoring ASR result with unsupported shape: %s", payload)
             return
-        text = (first.get("text") or "").strip()
+        text = _normalize_asr_text(first.get("text") or "")
         utterances = first.get("utterances") or []
         additions = first.get("additions") or payload.get("additions") or {}
 
@@ -413,7 +445,7 @@ class VolcASR:
         partial_text = text
         for u in utterances:
             if u.get("definite"):
-                final_text += u.get("text", "")
+                final_text += _normalize_asr_text(u.get("text", ""))
             else:
                 # partial pieces are reflected in `text` already
                 pass

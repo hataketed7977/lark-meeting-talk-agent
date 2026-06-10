@@ -17,7 +17,7 @@ It is built on Feishu/Lark VC realtime audio, Volcengine streaming ASR, an OpenA
 
 ## Streaming Providers
 
-- ASR uses Volcengine streaming ASR over WebSocket, defaulting to the recommended SAUC BigModel v3 async endpoint `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` and `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`. If your account has Seed ASR 2.0 entitlement, set `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
+- ASR uses a pluggable backend. The default `VOLC_ASR_BACKEND=sdk` path is built on the official `volcengine_audio` STT helpers and targets the recommended SAUC BigModel v3 async endpoint `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` with `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`. A legacy handcrafted WebSocket backend remains available as fallback.
 - LLM replies use OpenAI-compatible streaming chat completions (`stream=True`) and are chunked into TTS as tokens arrive.
 - TTS uses Volcengine HTTP V3 unidirectional streaming by default with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`.
 
@@ -26,7 +26,7 @@ It is built on Feishu/Lark VC realtime audio, Volcengine streaming ASR, an OpenA
 ```text
 Feishu meeting audio
   -> Realtime WebSocket client
-  -> Volcengine streaming ASR (SAUC BigModel v3)
+  -> Volcengine streaming ASR backend (SDK by default)
   -> WAITING / ENGAGED / SPEAKING state machine
   -> Meeting memory + OpenAI-compatible streaming LLM
   -> Volcengine streaming TTS (HTTP V3 / TTS 2.0)
@@ -65,10 +65,10 @@ cp .env.example .env
 Fill in `.env` with:
 
 - Feishu/Lark app credentials and a user access token or refresh token.
-- Volcengine ASR credentials. ASR defaults to the streaming BigModel endpoint
-  `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` and
-  `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`; Seed ASR 2.0 accounts can
-  use `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
+- Volcengine ASR credentials. ASR defaults to `VOLC_ASR_BACKEND=sdk`,
+  `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`,
+  and `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`; Seed ASR 2.0 accounts
+  can use `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
 - OpenAI-compatible LLM endpoint, key, and model name via `LLM_*` variables.
 - Volcengine TTS credentials. TTS defaults to the HTTP V3 TTS 2.0 character API
   with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0` and the bilingual youth voice

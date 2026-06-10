@@ -17,11 +17,13 @@ import asyncio
 import enum
 import logging
 import math
+import re
 import struct
 import time
 from typing import Optional
 
-from lark_meeting_voice.asr.volc_asr import VolcASR
+from lark_meeting_voice.asr.base import SpeechRecognizer
+from lark_meeting_voice.asr.factory import create_asr_backend
 from lark_meeting_voice.audio.framer import PacedSender, split_pcm
 from lark_meeting_voice.audio.resample import downsample_24k_to_16k
 from lark_meeting_voice.config import CFG
@@ -59,6 +61,33 @@ def _contains_cjk(text: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in text)
 
 
+_LOW_VALUE_QUERY_WORDS = {
+    "ah",
+    "aha",
+    "er",
+    "erm",
+    "hm",
+    "hmm",
+    "huh",
+    "mm",
+    "mmm",
+    "oh",
+    "ooh",
+    "uh",
+    "uhh",
+    "um",
+    "umm",
+}
+
+
+def _is_low_value_query(text: str) -> bool:
+    normalized = re.sub(r"[^a-z]+", " ", (text or "").lower()).strip()
+    if not normalized:
+        return True
+    words = normalized.split()
+    return len(words) == 1 and words[0] in _LOW_VALUE_QUERY_WORDS
+
+
 class State(str, enum.Enum):
     WAITING = "waiting"
     ENGAGED = "engaged"
@@ -83,7 +112,7 @@ class Orchestrator:
             max_recent_utterances=CFG.agent.memory_recent_utterances,
             max_summary_items=CFG.agent.memory_summary_items,
         )
-        self._asr: Optional[VolcASR] = None
+        self._asr: Optional[SpeechRecognizer] = None
         self._sender = PacedSender(self._rt.send_audio)
 
         self._state: State = State.WAITING
@@ -129,16 +158,16 @@ class Orchestrator:
             log.exception("Failed to start PacedSender — aborting")
             raise
 
-        self._asr = VolcASR(
+        self._asr = create_asr_backend(
             on_partial=self._on_partial,
             on_final=self._on_final,
             on_error=self._on_asr_error,
         )
         try:
             await self._asr.start()
-            log.info("VolcASR started")
+            log.info("ASR backend started")
         except Exception:
-            log.exception("Failed to start VolcASR — aborting orchestrator")
+            log.exception("Failed to start ASR backend — aborting orchestrator")
             raise
 
         # Spawn the downstream pump (Feishu -> ASR).
@@ -235,12 +264,17 @@ class Orchestrator:
 
         if self._state == State.WAITING:
             if not self._wake.is_wake(text):
+                self._remember_transcript(text, source="meeting_passive_asr")
                 return
             await self._enter_engaged()
             query = self._wake.strip_wake(text).strip()
             if not query:
                 await self._spawn_fixed_reply(self._wake_ack_text(text))
                 return
+            if _is_low_value_query(query):
+                log.info("Ignoring low-value wake query=%r", query)
+                return
+            self._remember_transcript(query, source="user_query")
             await self._spawn_reply(query)
             return
 
@@ -264,6 +298,10 @@ class Orchestrator:
             else text.strip()
         )
         if query:
+            if _is_low_value_query(query):
+                log.info("Ignoring low-value follow-up query=%r", query)
+                return
+            self._remember_transcript(query, source="user_query")
             await self._spawn_reply(query)
 
     async def _on_asr_error(self, msg: str) -> None:
@@ -325,6 +363,14 @@ class Orchestrator:
                 len(fetched.content),
             )
 
+    def _remember_transcript(self, text: str, *, source: str) -> None:
+        self._memory.add_transcript(text, source=source)
+        self._maybe_schedule_memory_rollup()
+
+    def _remember_assistant_reply(self, text: str) -> None:
+        self._memory.add_transcript(text, source="assistant_reply")
+        self._maybe_schedule_memory_rollup()
+
     def _maybe_schedule_memory_rollup(self) -> None:
         if not self._memory.needs_rollup(CFG.agent.memory_rollup_utterances):
             return
@@ -375,6 +421,8 @@ class Orchestrator:
         log.info("Conversation state -> WAITING")
 
     async def _maybe_expire_engaged_session(self) -> None:
+        if CFG.agent.engaged_idle_timeout_s <= 0:
+            return
         if self._state != State.ENGAGED or self._engaged_last_active_at <= 0:
             return
         if (
@@ -456,6 +504,7 @@ class Orchestrator:
                     recent_limit=CFG.agent.memory_context_recent_utterances,
                     retrieval_limit=CFG.agent.memory_retrieval_max_items,
                 ),
+                on_complete=self._remember_assistant_reply,
             )
             async for sentence in sentence_chunks(
                 token_stream,
@@ -528,6 +577,8 @@ class Orchestrator:
                 total_s,
                 self._tts_audio_started,
             )
+            if not cancel_event.is_set():
+                self._remember_assistant_reply(text)
         except asyncio.CancelledError:
             log.info("Fixed reply task cancelled")
             raise
