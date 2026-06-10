@@ -34,15 +34,15 @@ class FeishuConfig:
 
 @dataclass
 class ASRConfig:
-    backend: str = os.getenv("VOLC_ASR_BACKEND", "sdk")
+    backend: str = os.getenv("VOLC_ASR_BACKEND", "legacy")
     appid: str = os.getenv("VOLC_ASR_APPID", "")
     token: str = os.getenv("VOLC_ASR_TOKEN", "")
     cluster: str = os.getenv("VOLC_ASR_CLUSTER", "volcengine_streaming_common")
     resource_id: str = os.getenv("VOLC_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration")
     ws_url: str = os.getenv(
-        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v2/asr"
     )
-    language: str = os.getenv("VOLC_ASR_LANGUAGE", "zh-CN")
+    language: str = os.getenv("VOLC_ASR_LANGUAGE", "en-US")
     sample_rate: int = 16000
     connect_timeout_s: float = float(os.getenv("VOLC_ASR_CONNECT_TIMEOUT_S", "10"))
     stream_idle_timeout_s: float = float(
@@ -60,21 +60,27 @@ class LLMConfig:
     system_prompt: str = os.getenv(
         "LLM_SYSTEM_PROMPT",
         (
-            "You are James, a real-time meeting voice assistant. Reply in the user's "
-            "language. Start with a direct one-sentence answer, then add at most "
-            "3 concise bullets if useful. Ground answers in Meeting Memory; if the "
-            "memory does not support an answer, say so briefly. For summaries or "
-            "evaluations, use: overview, highlights, issues, suggestions. Keep most "
-            "voice replies under 80 words unless the user asks for detail."
+            "You are James, a real-time meeting voice assistant for English-first "
+            "meetings. Reply in natural spoken English by default. Only reply in "
+            "Chinese when the current user utterance clearly contains Chinese "
+            "characters and is primarily Chinese. Do not switch to Chinese because "
+            "of Chinese punctuation, mixed punctuation, prior history, or meeting "
+            "memory language. Sound like a polished live assistant: one smooth short "
+            "spoken paragraph, not bullets, unless the user explicitly asks for a "
+            "list. Start with a direct answer, then add one brief supporting "
+            "sentence if useful. Ground answers in Meeting Memory; if the memory "
+            "does not support an answer, say so briefly. For summaries or "
+            "evaluations, keep the response concise, structured, and easy to speak "
+            "aloud."
         ),
     )
     max_history_turns: int = int(os.getenv("LLM_MAX_HISTORY_TURNS", "8"))
-    meeting_context_max_chars: int = int(os.getenv("MEETING_CONTEXT_MAX_CHARS", "6000"))
-    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "220"))
+    meeting_context_max_chars: int = int(os.getenv("MEETING_CONTEXT_MAX_CHARS", "2500"))
+    max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "100"))
     request_timeout_s: float = float(os.getenv("LLM_REQUEST_TIMEOUT_S", "20"))
     stream_idle_timeout_s: float = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT_S", "12"))
-    tts_chunk_min_chars: int = int(os.getenv("LLM_TTS_CHUNK_MIN_CHARS", "6"))
-    tts_chunk_max_chars: int = int(os.getenv("LLM_TTS_CHUNK_MAX_CHARS", "80"))
+    tts_chunk_min_chars: int = int(os.getenv("LLM_TTS_CHUNK_MIN_CHARS", "12"))
+    tts_chunk_max_chars: int = int(os.getenv("LLM_TTS_CHUNK_MAX_CHARS", "100"))
 
 
 @dataclass
@@ -92,7 +98,7 @@ class TTSConfig:
     )
     resource_id: str = os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0")
     voice_type: str = os.getenv(
-        "VOLC_TTS_VOICE_TYPE", "zh_male_shaonianzixin_uranus_bigtts"
+        "VOLC_TTS_VOICE_TYPE", "zh_male_m191_uranus_bigtts"
     )
     sample_rate: int = 24000
     connect_timeout_s: float = float(os.getenv("VOLC_TTS_CONNECT_TIMEOUT_S", "10"))

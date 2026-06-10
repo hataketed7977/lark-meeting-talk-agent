@@ -17,16 +17,16 @@ It is built on Feishu/Lark VC realtime audio, Volcengine streaming ASR, an OpenA
 
 ## Streaming Providers
 
-- ASR uses a pluggable backend. The default `VOLC_ASR_BACKEND=sdk` path is built on the official `volcengine_audio` STT helpers and targets the recommended SAUC BigModel v3 async endpoint `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` with `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`. A legacy handcrafted WebSocket backend remains available as fallback.
+- ASR supports both the official SDK path and a legacy handcrafted WebSocket path. For the current English-first live demo, the preferred local runtime is `VOLC_ASR_BACKEND=legacy` with `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr` and `VOLC_ASR_LANGUAGE=en-US`, because it has been more stable in live meetings.
 - LLM replies use OpenAI-compatible streaming chat completions (`stream=True`) and are chunked into TTS as tokens arrive.
-- TTS uses Volcengine HTTP V3 unidirectional streaming by default with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`.
+- TTS uses Volcengine HTTP V3 unidirectional streaming by default with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`. The currently preferred bilingual demo voice is `zh_male_m191_uranus_bigtts`.
 
 ## Architecture
 
 ```text
 Feishu meeting audio
   -> Realtime WebSocket client
-  -> Volcengine streaming ASR backend (SDK by default)
+  -> Volcengine streaming ASR backend
   -> WAITING / ENGAGED / SPEAKING state machine
   -> Meeting memory + OpenAI-compatible streaming LLM
   -> Volcengine streaming TTS (HTTP V3 / TTS 2.0)
@@ -65,17 +65,27 @@ cp .env.example .env
 Fill in `.env` with:
 
 - Feishu/Lark app credentials and a user access token or refresh token.
-- Volcengine ASR credentials. ASR defaults to `VOLC_ASR_BACKEND=sdk`,
-  `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`,
-  and `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`; Seed ASR 2.0 accounts
-  can use `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
-- OpenAI-compatible LLM endpoint, key, and model name via `LLM_*` variables.
-- Volcengine TTS credentials. TTS defaults to the HTTP V3 TTS 2.0 character API
-  with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0` and the bilingual youth voice
-  `zh_male_shaonianzixin_uranus_bigtts`; set `VOLC_TTS_API_VERSION=1.0` to use
-  the legacy WebSocket TTS path.
+- Volcengine ASR credentials. The current stable demo path prefers `VOLC_ASR_BACKEND=legacy`, `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr`, `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`, and `VOLC_ASR_LANGUAGE=en-US`. The codebase still supports the SDK / v3 path if you want to experiment separately.
+- OpenAI-compatible LLM endpoint, key, and model name via `LLM_*` variables. The current low-latency demo choice is `doubao-seed-2-0-mini-260428`.
+- Volcengine TTS credentials. The preferred runtime uses TTS 2.0 HTTP V3 with `VOLC_TTS_API_VERSION=2.0`, `VOLC_TTS_HTTP_URL=https://openspeech.bytedance.com/api/v3/tts/unidirectional`, `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`, and `VOLC_TTS_VOICE_TYPE=zh_male_m191_uranus_bigtts`. Set `VOLC_TTS_API_VERSION=1.0` to use the legacy WebSocket TTS path.
+- Agent tuning values such as `ENGAGED_IDLE_TIMEOUT_S=0`, `LLM_TTS_CHUNK_MIN_CHARS=12`, and `LLM_TTS_CHUNK_MAX_CHARS=100` are part of the current stable spoken demo profile.
 
 VC bot join and realtime endpoint APIs require a Feishu/Lark `user_access_token`; app or tenant tokens are not enough for those calls. If `FEISHU_REFRESH_TOKEN`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET` are present, the agent can refresh the user token automatically.
+
+Recommended stable live-demo profile:
+
+```env
+VOLC_ASR_BACKEND=legacy
+VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr
+VOLC_ASR_LANGUAGE=en-US
+LLM_MODEL=doubao-seed-2-0-mini-260428
+VOLC_TTS_VOICE_TYPE=zh_male_m191_uranus_bigtts
+ENGAGED_IDLE_TIMEOUT_S=0
+LLM_TTS_CHUNK_MIN_CHARS=12
+LLM_TTS_CHUNK_MAX_CHARS=100
+```
+
+Keep `ENGAGED_IDLE_TIMEOUT_S` defined only once. A duplicate entry in `.env` previously caused the later value to override the intended runtime behavior.
 
 ### 4. Run
 
@@ -101,7 +111,7 @@ python -m lark_meeting_voice --ws-url 'wss://...'
 
 ## Environment Variables
 
-See `.env.example` for the complete list.
+See `.env.example` for the complete list and detailed inline comments.
 
 Important LLM variables are intentionally provider-neutral:
 
@@ -110,6 +120,13 @@ Important LLM variables are intentionally provider-neutral:
 - `LLM_MODEL`: model or endpoint identifier.
 - `LLM_SYSTEM_PROMPT`: realtime voice assistant behavior prompt.
 - `LLM_MAX_TOKENS`, `LLM_REQUEST_TIMEOUT_S`, `LLM_STREAM_IDLE_TIMEOUT_S`: latency and response controls.
+- `LLM_TTS_CHUNK_MIN_CHARS`, `LLM_TTS_CHUNK_MAX_CHARS`: how aggressively streamed LLM output is grouped before TTS starts speaking.
+
+Useful agent tuning variables:
+
+- `ENGAGED_IDLE_TIMEOUT_S`: `0` disables auto-return from `ENGAGED` back to `WAITING`.
+- `WAKE_WORDS`, `STOP_WORDS`, `END_SESSION_WORDS`: speech control phrases.
+- `MEMORY_*`: governs recent transcript retention, rolling summary cadence, and retrieval breadth.
 
 ## Development
 

@@ -27,3 +27,4 @@ lark-auth-qr.png
 .DS_Store
 .idea/
 .vscode/
+.trae-tmp/
