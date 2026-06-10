@@ -37,8 +37,9 @@ class ASRConfig:
     appid: str = os.getenv("VOLC_ASR_APPID", "")
     token: str = os.getenv("VOLC_ASR_TOKEN", "")
     cluster: str = os.getenv("VOLC_ASR_CLUSTER", "volcengine_streaming_common")
+    resource_id: str = os.getenv("VOLC_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration")
     ws_url: str = os.getenv(
-        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel"
+        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     )
     language: str = os.getenv("VOLC_ASR_LANGUAGE", "zh-CN")
     sample_rate: int = 16000
@@ -70,9 +71,7 @@ class LLMConfig:
     meeting_context_max_chars: int = int(os.getenv("MEETING_CONTEXT_MAX_CHARS", "6000"))
     max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "220"))
     request_timeout_s: float = float(os.getenv("LLM_REQUEST_TIMEOUT_S", "20"))
-    stream_idle_timeout_s: float = float(
-        os.getenv("LLM_STREAM_IDLE_TIMEOUT_S", "12")
-    )
+    stream_idle_timeout_s: float = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT_S", "12"))
     tts_chunk_min_chars: int = int(os.getenv("LLM_TTS_CHUNK_MIN_CHARS", "6"))
     tts_chunk_max_chars: int = int(os.getenv("LLM_TTS_CHUNK_MAX_CHARS", "80"))
 
@@ -82,11 +81,17 @@ class TTSConfig:
     appid: str = os.getenv("VOLC_TTS_APPID", "")
     token: str = os.getenv("VOLC_TTS_TOKEN", "")
     cluster: str = os.getenv("VOLC_TTS_CLUSTER", "volcano_tts")
+    api_version: str = os.getenv("VOLC_TTS_API_VERSION", "2.0")
     ws_url: str = os.getenv(
         "VOLC_TTS_WS_URL", "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
     )
+    http_url: str = os.getenv(
+        "VOLC_TTS_HTTP_URL",
+        "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
+    )
+    resource_id: str = os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0")
     voice_type: str = os.getenv(
-        "VOLC_TTS_VOICE_TYPE", "zh_male_M392_conversation_wvae_bigtts"
+        "VOLC_TTS_VOICE_TYPE", "zh_male_shaonianzixin_uranus_bigtts"
     )
     sample_rate: int = 24000
     connect_timeout_s: float = float(os.getenv("VOLC_TTS_CONNECT_TIMEOUT_S", "10"))
@@ -133,6 +138,14 @@ class AgentConfig:
     reply_error_tts_text: str = os.getenv(
         "REPLY_ERROR_TTS_TEXT",
         "抱歉，我刚才没组织好回答，请再说一遍。",
+    )
+    wake_ack_tts_text_zh: str = os.getenv(
+        "WAKE_ACK_TTS_TEXT_ZH",
+        "我在，请讲。",
+    )
+    wake_ack_tts_text_en: str = os.getenv(
+        "WAKE_ACK_TTS_TEXT_EN",
+        "I'm here. Go ahead.",
     )
     reconnect_attempts: int = int(os.getenv("AGENT_RECONNECT_ATTEMPTS", "3"))
     reconnect_backoff_s: float = float(os.getenv("AGENT_RECONNECT_BACKOFF_S", "2.0"))

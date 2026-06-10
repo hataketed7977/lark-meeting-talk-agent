@@ -29,6 +29,7 @@ This module exposes a simple callback API:
     await asr.feed_pcm(pcm16k_bytes)
     await asr.stop()
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +38,7 @@ import json
 import logging
 import struct
 import uuid
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import websockets
 
@@ -86,11 +87,11 @@ def _parse_response(data: bytes) -> dict:
 
     if message_type == FULL_SERVER_RESPONSE:
         if flags & POS_SEQUENCE:
-            result["sequence"] = struct.unpack(">i", data[cursor:cursor + 4])[0]
+            result["sequence"] = struct.unpack(">i", data[cursor : cursor + 4])[0]
             cursor += 4
-        payload_size = struct.unpack(">I", data[cursor:cursor + 4])[0]
+        payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
         cursor += 4
-        payload = data[cursor:cursor + payload_size]
+        payload = data[cursor : cursor + payload_size]
         if compression == COMPRESSION_GZIP and payload:
             payload = gzip.decompress(payload)
         try:
@@ -99,14 +100,14 @@ def _parse_response(data: bytes) -> dict:
             result["payload"] = {"_raw": payload}
     elif message_type == SERVER_ACK:
         if flags & POS_SEQUENCE:
-            result["sequence"] = struct.unpack(">i", data[cursor:cursor + 4])[0]
+            result["sequence"] = struct.unpack(">i", data[cursor : cursor + 4])[0]
             cursor += 4
     elif message_type == SERVER_ERROR:
-        result["code"] = struct.unpack(">i", data[cursor:cursor + 4])[0]
+        result["code"] = struct.unpack(">i", data[cursor : cursor + 4])[0]
         cursor += 4
-        payload_size = struct.unpack(">I", data[cursor:cursor + 4])[0]
+        payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
         cursor += 4
-        payload = data[cursor:cursor + payload_size]
+        payload = data[cursor : cursor + payload_size]
         if compression == COMPRESSION_GZIP and payload:
             try:
                 payload = gzip.decompress(payload)
@@ -120,6 +121,68 @@ def _parse_response(data: bytes) -> dict:
 
 
 OnText = Callable[[str], Awaitable[None]]
+
+
+def _is_v3_ws_url(ws_url: str) -> bool:
+    return "/api/v3/" in ws_url
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y"}
+    return False
+
+
+def _build_asr_start_request(req_id: str) -> dict[str, Any]:
+    audio: dict[str, Any] = {
+        "format": "pcm",
+        "codec": "raw",
+        "rate": CFG.asr.sample_rate,
+        "bits": 16,
+        "channel": 1,
+    }
+    if not _is_v3_ws_url(CFG.asr.ws_url):
+        audio["language"] = CFG.asr.language
+
+    request: dict[str, Any]
+    if _is_v3_ws_url(CFG.asr.ws_url):
+        request = {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+            "enable_ddc": False,
+            "show_utterances": True,
+            "result_type": "single",
+            # Force sentence boundaries so the meeting bot receives final turns
+            # during an open-ended conversation instead of only at stream end.
+            "end_window_size": 800,
+            "force_to_speech_time": 1000,
+        }
+    else:
+        request = {
+            "reqid": req_id,
+            "nbest": 1,
+            "workflow": "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate",
+            "show_language": False,
+            "show_utterances": True,
+            "result_type": "single",
+            "sequence": 1,
+        }
+
+    return {
+        "app": {
+            "appid": CFG.asr.appid,
+            "cluster": CFG.asr.cluster,
+            "token": CFG.asr.token,
+        },
+        "user": {"uid": "lark_meeting_voice"},
+        "audio": audio,
+        "request": request,
+    }
 
 
 class VolcASR:
@@ -138,6 +201,10 @@ class VolcASR:
         self._closed = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._last_partial: str = ""
+        self._logged_result_shape = False
+        self._feed_count = 0
+        self._recv_count = 0
+        self._next_sequence = 1
 
     async def start(self) -> None:
         headers = {
@@ -145,6 +212,16 @@ class VolcASR:
         }
         self._closed = asyncio.Event()
         req_id = str(uuid.uuid4())
+        self._next_sequence = 1
+        if "/api/v3/" in CFG.asr.ws_url:
+            headers.update(
+                {
+                    "X-Api-App-Key": CFG.asr.appid,
+                    "X-Api-Access-Key": CFG.asr.token,
+                    "X-Api-Resource-Id": CFG.asr.resource_id,
+                    "X-Api-Connect-Id": req_id,
+                }
+            )
         self._ws = await websockets.connect(
             CFG.asr.ws_url,
             additional_headers=headers,
@@ -154,46 +231,65 @@ class VolcASR:
             open_timeout=CFG.asr.connect_timeout_s,
             close_timeout=5,
         )
-        config = {
-            "app": {
-                "appid": CFG.asr.appid,
-                "cluster": CFG.asr.cluster,
-                "token": CFG.asr.token,
-            },
-            "user": {"uid": "lark_meeting_voice"},
-            "audio": {
-                "format": "pcm",
-                "codec": "raw",
-                "rate": CFG.asr.sample_rate,
-                "bits": 16,
-                "channel": 1,
-                "language": CFG.asr.language,
-            },
-            "request": {
-                "reqid": req_id,
-                "nbest": 1,
-                "workflow": "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate",
-                "show_language": False,
-                "show_utterances": True,
-                "result_type": "single",
-                "sequence": 1,
-            },
-        }
+        config = _build_asr_start_request(req_id)
         payload = gzip.compress(json.dumps(config).encode("utf-8"))
-        frame = _build_header(FULL_CLIENT_REQUEST) + struct.pack(">I", len(payload)) + payload
+        if _is_v3_ws_url(CFG.asr.ws_url):
+            frame = (
+                _build_header(FULL_CLIENT_REQUEST, flags=POS_SEQUENCE)
+                + struct.pack(">i", self._next_sequence)
+                + struct.pack(">I", len(payload))
+                + payload
+            )
+            self._next_sequence += 1
+        else:
+            frame = (
+                _build_header(FULL_CLIENT_REQUEST)
+                + struct.pack(">I", len(payload))
+                + payload
+            )
         async with self._send_lock:
-            await asyncio.wait_for(self._ws.send(frame), timeout=CFG.asr.connect_timeout_s)
+            await asyncio.wait_for(
+                self._ws.send(frame), timeout=CFG.asr.connect_timeout_s
+            )
         self._recv_task = asyncio.create_task(self._recv_loop(), name="asr-recv")
-        log.info("Volc ASR session started req_id=%s", req_id)
+        log.info(
+            "Volc ASR stream started req_id=%s endpoint=%s resource_id=%s language=%s",
+            req_id,
+            CFG.asr.ws_url,
+            CFG.asr.resource_id,
+            CFG.asr.language,
+        )
 
     async def feed_pcm(self, pcm16k: bytes) -> None:
         if not pcm16k or self._ws is None or self._closed.is_set():
             return
+        self._feed_count += 1
+        if self._feed_count == 1 or self._feed_count % 100 == 0:
+            log.info(
+                "ASR feed chunk count=%d pcm_bytes=%d",
+                self._feed_count,
+                len(pcm16k),
+            )
         payload = gzip.compress(pcm16k)
-        frame = _build_header(AUDIO_ONLY_REQUEST) + struct.pack(">I", len(payload)) + payload
+        if _is_v3_ws_url(CFG.asr.ws_url):
+            frame = (
+                _build_header(AUDIO_ONLY_REQUEST, flags=POS_SEQUENCE)
+                + struct.pack(">i", self._next_sequence)
+                + struct.pack(">I", len(payload))
+                + payload
+            )
+            self._next_sequence += 1
+        else:
+            frame = (
+                _build_header(AUDIO_ONLY_REQUEST)
+                + struct.pack(">I", len(payload))
+                + payload
+            )
         async with self._send_lock:
             try:
-                await asyncio.wait_for(self._ws.send(frame), timeout=CFG.asr.stream_idle_timeout_s)
+                await asyncio.wait_for(
+                    self._ws.send(frame), timeout=CFG.asr.stream_idle_timeout_s
+                )
             except (asyncio.TimeoutError, websockets.ConnectionClosed):
                 self._closed.set()
                 if self._on_error:
@@ -204,12 +300,26 @@ class VolcASR:
         if self._ws is not None:
             try:
                 # Send final empty audio with NEG flag to signal end.
-                payload = gzip.compress(b"")
-                frame = (
-                    _build_header(AUDIO_ONLY_REQUEST, flags=NEG_SEQUENCE)
-                    + struct.pack(">I", len(payload))
-                    + payload
-                )
+                if _is_v3_ws_url(CFG.asr.ws_url):
+                    final_seq = -self._next_sequence
+                    payload = b""
+                    b0 = (PROTOCOL_VERSION << 4) | DEFAULT_HEADER_SIZE
+                    b1 = (AUDIO_ONLY_REQUEST << 4) | NEG_WITH_SEQUENCE
+                    b2 = (SERIALIZATION_JSON << 4) | 0
+                    b3 = 0
+                    frame = (
+                        bytes([b0, b1, b2, b3])
+                        + struct.pack(">i", final_seq)
+                        + struct.pack(">I", len(payload))
+                        + payload
+                    )
+                else:
+                    payload = gzip.compress(b"")
+                    frame = (
+                        _build_header(AUDIO_ONLY_REQUEST, flags=NEG_SEQUENCE)
+                        + struct.pack(">I", len(payload))
+                        + payload
+                    )
                 async with self._send_lock:
                     await self._ws.send(frame)
             except Exception:  # noqa: BLE001
@@ -230,20 +340,39 @@ class VolcASR:
         try:
             while not self._closed.is_set():
                 try:
-                    msg = await asyncio.wait_for(self._ws.recv(), timeout=CFG.asr.stream_idle_timeout_s)
+                    msg = await asyncio.wait_for(
+                        self._ws.recv(), timeout=CFG.asr.stream_idle_timeout_s
+                    )
                 except asyncio.TimeoutError:
-                    log.warning("ASR stream idle timeout after %.1fs", CFG.asr.stream_idle_timeout_s)
-                    if self._on_error:
-                        await self._on_error("asr_idle_timeout")
-                    break
+                    # V3 ASR may stay quiet until speech arrives. The websocket
+                    # layer already has ping/pong health checks, so lack of a
+                    # server message is not itself a fatal condition.
+                    log.debug(
+                        "ASR recv idle for %.1fs; keeping stream open",
+                        CFG.asr.stream_idle_timeout_s,
+                    )
+                    continue
                 except websockets.ConnectionClosed:
                     break
                 if not isinstance(msg, (bytes, bytearray)):
                     continue
                 parsed = _parse_response(bytes(msg))
+                self._recv_count += 1
                 mt = parsed.get("message_type")
+                if self._recv_count == 1:
+                    payload = parsed.get("payload", {})
+                    payload_keys = (
+                        sorted(payload.keys()) if isinstance(payload, dict) else []
+                    )
+                    log.info(
+                        "ASR first server frame message_type=%s flags=%s sequence=%s payload_keys=%s",
+                        mt,
+                        parsed.get("flags"),
+                        parsed.get("sequence"),
+                        payload_keys,
+                    )
                 if mt == FULL_SERVER_RESPONSE:
-                    await self._handle_result(parsed.get("payload", {}))
+                    await self._handle_result(parsed)
                 elif mt == SERVER_ERROR:
                     code = parsed.get("code")
                     payload = parsed.get("payload", {})
@@ -255,14 +384,30 @@ class VolcASR:
         finally:
             self._closed.set()
 
-    async def _handle_result(self, payload: dict) -> None:
-        # Result shape: {"result": [{"text": "...", "utterances": [{"definite": true, "text": "..."}, ...]}], ...}
+    async def _handle_result(self, parsed: dict) -> None:
+        payload = parsed.get("payload", {})
+        # Result shape is v2/v3 dependent. v3 can return partial text without
+        # `utterances[].definite`, so we need a broader final-turn detector.
         results = payload.get("result") or []
         if not results:
+            if payload and not self._logged_result_shape:
+                self._logged_result_shape = True
+                log.info(
+                    "ASR payload without result: keys=%s payload=%s",
+                    sorted(payload.keys()),
+                    payload,
+                )
             return
-        first = results[0]
+        if isinstance(results, dict):
+            first = results
+        elif isinstance(results, list):
+            first = results[0]
+        else:
+            log.debug("Ignoring ASR result with unsupported shape: %s", payload)
+            return
         text = (first.get("text") or "").strip()
         utterances = first.get("utterances") or []
+        additions = first.get("additions") or payload.get("additions") or {}
 
         final_text = ""
         partial_text = text
@@ -272,6 +417,26 @@ class VolcASR:
             else:
                 # partial pieces are reflected in `text` already
                 pass
+
+        explicit_final = any(
+            _as_bool(v)
+            for v in (
+                first.get("definite"),
+                first.get("is_final"),
+                first.get("final"),
+                payload.get("definite"),
+                payload.get("is_final"),
+                payload.get("final"),
+                additions.get("definite"),
+                additions.get("is_final"),
+                additions.get("final"),
+            )
+        )
+        sequence = parsed.get("sequence")
+        if isinstance(sequence, int) and sequence < 0:
+            explicit_final = True
+        if not final_text and explicit_final and text:
+            final_text = text
 
         if final_text and final_text != self._last_partial:
             self._last_partial = ""

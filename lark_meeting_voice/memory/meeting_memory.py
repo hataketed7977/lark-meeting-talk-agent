@@ -21,7 +21,24 @@ class MeetingFact:
     created_at: str
 
 
+@dataclass
+class MeetingArtifact:
+    kind: str
+    token: str
+    title: str
+    meeting_id: str
+    created_at: str
+    content: str = ""
+    fetch_status: str = "pending"
+    fetch_error: str = ""
+
+
 class MeetingMemory:
+    _ARTIFACT_EXCERPT_LIMITS = {
+        "note": 1200,
+        "minute": 1200,
+        "verbatim": 800,
+    }
     _ACTION_RE = re.compile(
         r"(todo|action item|follow up|follow-up|owner|deadline|负责|跟进|待办|行动项|下周|明天|今天内)",
         re.IGNORECASE,
@@ -49,6 +66,11 @@ class MeetingMemory:
         self._decisions: Deque[MeetingFact] = deque(maxlen=max_summary_items)
         self._risks: Deque[MeetingFact] = deque(maxlen=max_summary_items)
         self._questions: Deque[MeetingFact] = deque(maxlen=max_summary_items)
+        self._note: MeetingArtifact | None = None
+        self._verbatim: MeetingArtifact | None = None
+        self._minute: MeetingArtifact | None = None
+        self._meeting_meta: dict[str, str] = {}
+        self._seen_event_ids: set[str] = set()
         self._rolling_summary = ""
         self._summary_cursor = 0
 
@@ -121,6 +143,99 @@ class MeetingMemory:
             "open_questions": [item.text for item in self._questions],
         }
 
+    def add_meeting_event(self, event_key: str, payload: dict) -> bool:
+        event_id = str(payload.get("event_id") or "").strip()
+        if event_id and event_id in self._seen_event_ids:
+            return False
+        if event_id:
+            self._seen_event_ids.add(event_id)
+
+        now = datetime.now(timezone.utc).isoformat()
+        if event_key == "vc.meeting.participant_meeting_ended_v1":
+            self._meeting_meta = {
+                "meeting_id": str(payload.get("meeting_id") or ""),
+                "meeting_no": str(payload.get("meeting_no") or ""),
+                "topic": str(payload.get("topic") or ""),
+                "start_time": str(payload.get("start_time") or ""),
+                "end_time": str(payload.get("end_time") or ""),
+            }
+            return True
+
+        if event_key == "vc.note.generated_v1":
+            source = payload.get("note_source") or {}
+            meeting_id = str(source.get("source_entity_id") or "")
+            note_token = str(payload.get("note_token") or "").strip()
+            verbatim_token = str(payload.get("verbatim_token") or "").strip()
+            title = str(payload.get("title") or "").strip()
+            if note_token:
+                self._note = MeetingArtifact(
+                    kind="note",
+                    token=note_token,
+                    title=title,
+                    meeting_id=meeting_id,
+                    created_at=now,
+                )
+            if verbatim_token:
+                self._verbatim = MeetingArtifact(
+                    kind="verbatim",
+                    token=verbatim_token,
+                    title=title,
+                    meeting_id=meeting_id,
+                    created_at=now,
+                )
+            return bool(note_token or verbatim_token)
+
+        if event_key == "minutes.minute.generated_v1":
+            source = payload.get("minute_source") or {}
+            meeting_id = str(source.get("source_entity_id") or "")
+            minute_token = str(payload.get("minute_token") or "").strip()
+            title = str(payload.get("title") or "").strip()
+            if minute_token:
+                self._minute = MeetingArtifact(
+                    kind="minute",
+                    token=minute_token,
+                    title=title,
+                    meeting_id=meeting_id,
+                    created_at=now,
+                )
+                return True
+            return False
+
+        return False
+
+    def artifacts(self) -> list[MeetingArtifact]:
+        return [item for item in (self._note, self._verbatim, self._minute) if item is not None]
+
+    def pending_artifacts(self) -> list[MeetingArtifact]:
+        return [item for item in self.artifacts() if item.fetch_status == "pending"]
+
+    def apply_artifact_content(self, kind: str, token: str, content: str) -> bool:
+        artifact = self._find_artifact(kind, token)
+        if artifact is None:
+            return False
+        cleaned = self._clean_artifact_content(content)
+        artifact.content = cleaned
+        artifact.fetch_status = "ready" if cleaned else "empty"
+        artifact.fetch_error = ""
+        if cleaned:
+            self._extract_fact(cleaned, artifact.created_at)
+        return True
+
+    def apply_artifact_error(self, kind: str, token: str, error: str) -> bool:
+        artifact = self._find_artifact(kind, token)
+        if artifact is None:
+            return False
+        artifact.fetch_status = "error"
+        artifact.fetch_error = " ".join((error or "").strip().split())
+        return True
+
+    def mark_artifact_fetching(self, kind: str, token: str) -> bool:
+        artifact = self._find_artifact(kind, token)
+        if artifact is None or artifact.fetch_status != "pending":
+            return False
+        artifact.fetch_status = "fetching"
+        return True
+
     def build_context_block(
         self,
         query: str | None = None,
@@ -149,6 +264,37 @@ class MeetingMemory:
         if snapshot["open_questions"]:
             parts.append("Open questions:")
             parts.extend(f"- {item}" for item in snapshot["open_questions"])
+        if self._meeting_meta:
+            parts.append("Current meeting event metadata:")
+            if self._meeting_meta.get("meeting_id"):
+                parts.append(f"- Meeting ID: {self._meeting_meta['meeting_id']}")
+            if self._meeting_meta.get("meeting_no"):
+                parts.append(f"- Meeting number: {self._meeting_meta['meeting_no']}")
+            if self._meeting_meta.get("topic"):
+                parts.append(f"- Topic: {self._meeting_meta['topic']}")
+            if self._meeting_meta.get("start_time"):
+                parts.append(f"- Started at: {self._meeting_meta['start_time']}")
+            if self._meeting_meta.get("end_time"):
+                parts.append(f"- Ended at: {self._meeting_meta['end_time']}")
+        artifacts = [
+            self._note,
+            self._verbatim,
+            self._minute,
+        ]
+        artifacts = [item for item in artifacts if item is not None]
+        if artifacts:
+            parts.append("Current meeting generated artifacts:")
+            for artifact in artifacts:
+                title = f" title={artifact.title}" if artifact.title else ""
+                status = f" status={artifact.fetch_status}"
+                item = f"- {artifact.kind} token={artifact.token}{title}{status}".rstrip()
+                if artifact.fetch_error:
+                    item += f" error={artifact.fetch_error}"
+                parts.append(item)
+            excerpts = self._artifact_excerpts()
+            if excerpts:
+                parts.append("Current meeting artifact excerpts:")
+                parts.extend(excerpts)
         evidence = self._retrieve_evidence(query or "", retrieval_limit)
         if evidence:
             parts.append("Relevant earlier transcript:")
@@ -183,6 +329,31 @@ class MeetingMemory:
         selected = sorted(scored[:limit], key=lambda row: row[1])
         return [item for _, _, item in selected]
 
+    def _artifact_excerpts(self) -> list[str]:
+        parts: list[str] = []
+        for artifact in self.artifacts():
+            if artifact.fetch_status != "ready" or not artifact.content:
+                continue
+            limit = self._ARTIFACT_EXCERPT_LIMITS.get(artifact.kind, 1000)
+            excerpt = artifact.content[:limit].strip()
+            if len(artifact.content) > limit:
+                excerpt = excerpt.rstrip() + "..."
+            title = f" ({artifact.title})" if artifact.title else ""
+            parts.append(f"- {artifact.kind}{title}: {excerpt}")
+        return parts
+
+    def _find_artifact(self, kind: str, token: str) -> MeetingArtifact | None:
+        for artifact in self.artifacts():
+            if artifact.kind == kind and artifact.token == token:
+                return artifact
+        return None
+
+    def _clean_artifact_content(self, content: str) -> str:
+        text = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in text.split("\n")]
+        cleaned = "\n".join(line for line in lines if line)
+        return cleaned.strip()
+
     def clear(self) -> None:
         self._all.clear()
         self._recent.clear()
@@ -190,5 +361,10 @@ class MeetingMemory:
         self._decisions.clear()
         self._risks.clear()
         self._questions.clear()
+        self._note = None
+        self._verbatim = None
+        self._minute = None
+        self._meeting_meta = {}
+        self._seen_event_ids.clear()
         self._rolling_summary = ""
         self._summary_cursor = 0

@@ -15,15 +15,21 @@ It is built on Feishu/Lark VC realtime audio, Volcengine streaming ASR, an OpenA
 - Streams LLM text into TTS sentence chunks for lower perceived latency.
 - Runs as a single-process asyncio service with no broker or database requirement.
 
+## Streaming Providers
+
+- ASR uses Volcengine streaming ASR over WebSocket, defaulting to the recommended SAUC BigModel v3 async endpoint `wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` and `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`. If your account has Seed ASR 2.0 entitlement, set `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
+- LLM replies use OpenAI-compatible streaming chat completions (`stream=True`) and are chunked into TTS as tokens arrive.
+- TTS uses Volcengine HTTP V3 unidirectional streaming by default with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`.
+
 ## Architecture
 
 ```text
 Feishu meeting audio
   -> Realtime WebSocket client
-  -> Volcengine streaming ASR
+  -> Volcengine streaming ASR (SAUC BigModel v3)
   -> WAITING / ENGAGED / SPEAKING state machine
-  -> Meeting memory + OpenAI-compatible LLM
-  -> Volcengine streaming TTS
+  -> Meeting memory + OpenAI-compatible streaming LLM
+  -> Volcengine streaming TTS (HTTP V3 / TTS 2.0)
   -> paced 24 kHz PCM audio back to Feishu
 ```
 
@@ -59,9 +65,15 @@ cp .env.example .env
 Fill in `.env` with:
 
 - Feishu/Lark app credentials and a user access token or refresh token.
-- Volcengine ASR credentials.
+- Volcengine ASR credentials. ASR defaults to the streaming BigModel endpoint
+  `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel` and
+  `VOLC_ASR_RESOURCE_ID=volc.bigasr.sauc.duration`; Seed ASR 2.0 accounts can
+  use `VOLC_ASR_RESOURCE_ID=volc.seedasr.sauc.duration`.
 - OpenAI-compatible LLM endpoint, key, and model name via `LLM_*` variables.
-- Volcengine TTS credentials.
+- Volcengine TTS credentials. TTS defaults to the HTTP V3 TTS 2.0 character API
+  with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0` and the bilingual youth voice
+  `zh_male_shaonianzixin_uranus_bigtts`; set `VOLC_TTS_API_VERSION=1.0` to use
+  the legacy WebSocket TTS path.
 
 VC bot join and realtime endpoint APIs require a Feishu/Lark `user_access_token`; app or tenant tokens are not enough for those calls. If `FEISHU_REFRESH_TOKEN`, `FEISHU_APP_ID`, and `FEISHU_APP_SECRET` are present, the agent can refresh the user token automatically.
 

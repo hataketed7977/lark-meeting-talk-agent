@@ -16,6 +16,8 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import math
+import struct
 import time
 from typing import Optional
 
@@ -24,6 +26,14 @@ from lark_meeting_voice.audio.framer import PacedSender, split_pcm
 from lark_meeting_voice.audio.resample import downsample_24k_to_16k
 from lark_meeting_voice.config import CFG
 from lark_meeting_voice.intent.stop_classifier import StopClassifier
+from lark_meeting_voice.lark.artifact_fetcher import (
+    ArtifactFetchError,
+    fetch_artifact_content,
+)
+from lark_meeting_voice.lark.event_consumer import (
+    CurrentMeetingEventConsumers,
+    MeetingEvent,
+)
 from lark_meeting_voice.lark.realtime import RealtimeClient
 from lark_meeting_voice.llm.openai_compatible import OpenAICompatibleLLM, sentence_chunks
 from lark_meeting_voice.memory.meeting_memory import MeetingMemory
@@ -33,6 +43,22 @@ from lark_meeting_voice.wake.detector import WakeDetector
 log = logging.getLogger(__name__)
 
 
+def _pcm16_metrics(pcm: bytes) -> tuple[int, int]:
+    if not pcm:
+        return 0, 0
+    count = len(pcm) // 2
+    if count <= 0:
+        return 0, 0
+    samples = struct.unpack("<" + "h" * count, pcm[: count * 2])
+    peak = max(abs(s) for s in samples)
+    rms = int(math.sqrt(sum(s * s for s in samples) / count))
+    return peak, rms
+
+
+def _contains_cjk(text: str) -> bool:
+    return any("\u4e00" <= ch <= "\u9fff" for ch in text)
+
+
 class State(str, enum.Enum):
     WAITING = "waiting"
     ENGAGED = "engaged"
@@ -40,8 +66,14 @@ class State(str, enum.Enum):
 
 
 class Orchestrator:
-    def __init__(self, realtime: RealtimeClient) -> None:
+    def __init__(
+        self,
+        realtime: RealtimeClient,
+        *,
+        meeting_id: str | None = None,
+    ) -> None:
         self._rt = realtime
+        self._meeting_id = meeting_id
         self._wake = WakeDetector(CFG.agent.wake_words)
         self._stop = StopClassifier(CFG.agent.stop_words)
         self._end_session = StopClassifier(CFG.agent.end_session_words)
@@ -74,8 +106,17 @@ class Orchestrator:
         self._reply_started_at: float = 0.0
         self._reply_barge_in_count: int = 0
         self._engaged_last_active_at: float = 0.0
+        self._event_consumers: CurrentMeetingEventConsumers | None = None
+        self._artifact_tasks: dict[tuple[str, str], asyncio.Task] = {}
 
     async def run(self) -> None:
+        if self._meeting_id:
+            self._event_consumers = CurrentMeetingEventConsumers(
+                self._meeting_id,
+                self._on_meeting_event,
+            )
+            await self._event_consumers.start()
+            log.info("Meeting event consumers started meeting_id=%s", self._meeting_id)
         # Start the paced sender FIRST so we begin streaming silence frames
         # upstream within ~100ms of session.created. The Feishu Realtime
         # server closes the session (reason=0) after ~1s of no upstream audio,
@@ -109,6 +150,16 @@ class Orchestrator:
                 await self._maybe_expire_engaged_session()
         finally:
             pump_task.cancel()
+            if self._event_consumers is not None:
+                await self._event_consumers.stop()
+            for task in self._artifact_tasks.values():
+                task.cancel()
+            for task in self._artifact_tasks.values():
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            self._artifact_tasks.clear()
             if self._summary_task is not None:
                 self._summary_task.cancel()
                 try:
@@ -125,10 +176,22 @@ class Orchestrator:
     async def _downstream_pump(self) -> None:
         """Read 24 kHz PCM from Feishu -> downsample -> feed ASR."""
         assert self._asr is not None
+        chunk_count = 0
         try:
             async for audio in self._rt.downstream():
                 if not audio.pcm:
                     continue
+                chunk_count += 1
+                if chunk_count == 1 or chunk_count % 100 == 0:
+                    peak24k, rms24k = _pcm16_metrics(audio.pcm)
+                    log.info(
+                        "Downstream pump chunk count=%d pcm24k_bytes=%d duration_ms=%d peak24k=%d rms24k=%d",
+                        chunk_count,
+                        len(audio.pcm),
+                        audio.duration_ms,
+                        peak24k,
+                        rms24k,
+                    )
                 pcm16k = downsample_24k_to_16k(audio.pcm)
                 await self._asr.feed_pcm(pcm16k)
         except asyncio.CancelledError:
@@ -169,8 +232,6 @@ class Orchestrator:
 
     async def _on_final(self, text: str) -> None:
         log.info("ASR final: %s", text)
-        self._memory.add_transcript(text)
-        self._maybe_schedule_memory_rollup()
 
         if self._state == State.WAITING:
             if not self._wake.is_wake(text):
@@ -178,7 +239,8 @@ class Orchestrator:
             await self._enter_engaged()
             query = self._wake.strip_wake(text).strip()
             if not query:
-                query = "Give a short acknowledgement that you are now listening and ask how you can help."
+                await self._spawn_fixed_reply(self._wake_ack_text(text))
+                return
             await self._spawn_reply(query)
             return
 
@@ -209,6 +271,59 @@ class Orchestrator:
         if self._state == State.SPEAKING:
             log.warning("ASR failed during active reply -> abort reply")
             await self._abort_reply(next_state=State.ENGAGED)
+
+    async def _on_meeting_event(self, event: MeetingEvent) -> None:
+        updated = self._memory.add_meeting_event(event.event_key, event.payload)
+        if updated:
+            log.info(
+                "Meeting event captured key=%s fields=%s",
+                event.event_key,
+                sorted(event.payload.keys()),
+            )
+            self._schedule_artifact_fetches()
+
+    def _schedule_artifact_fetches(self) -> None:
+        for artifact in self._memory.pending_artifacts():
+            key = (artifact.kind, artifact.token)
+            if key in self._artifact_tasks:
+                continue
+            if not self._memory.mark_artifact_fetching(artifact.kind, artifact.token):
+                continue
+            self._artifact_tasks[key] = asyncio.create_task(
+                self._fetch_artifact_content(artifact.kind, artifact.token),
+                name=f"artifact-fetch-{artifact.kind}",
+            )
+
+    async def _fetch_artifact_content(self, kind: str, token: str) -> None:
+        key = (kind, token)
+        try:
+            artifact = next(
+                item
+                for item in self._memory.artifacts()
+                if item.kind == kind and item.token == token
+            )
+            fetched = await fetch_artifact_content(artifact)
+        except StopIteration:
+            return
+        except ArtifactFetchError as exc:
+            self._memory.apply_artifact_error(kind, token, str(exc))
+            log.warning("Meeting artifact fetch failed kind=%s token=%s: %s", kind, token, exc)
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self._memory.apply_artifact_error(kind, token, str(exc))
+            log.warning("Meeting artifact fetch crashed kind=%s token=%s: %s", kind, token, exc)
+            return
+        finally:
+            self._artifact_tasks.pop(key, None)
+        if self._memory.apply_artifact_content(kind, token, fetched.content):
+            log.info(
+                "Meeting artifact content captured kind=%s token=%s chars=%d",
+                kind,
+                token,
+                len(fetched.content),
+            )
 
     def _maybe_schedule_memory_rollup(self) -> None:
         if not self._memory.needs_rollup(CFG.agent.memory_rollup_utterances):
@@ -285,6 +400,21 @@ class Orchestrator:
             self._reply_task = asyncio.create_task(
                 self._run_reply(query, self._cancel_event),
                 name="reply",
+            )
+
+    async def _spawn_fixed_reply(self, text: str) -> None:
+        async with self._state_lock:
+            await self._abort_reply_locked(next_state=State.ENGAGED)
+            self._cancel_event = asyncio.Event()
+            self._tts_audio_started = False
+            self._tts_started_at = 0.0
+            self._reply_started_at = time.monotonic()
+            self._reply_barge_in_count = 0
+            self._engaged_last_active_at = time.monotonic()
+            self._state = State.SPEAKING
+            self._reply_task = asyncio.create_task(
+                self._run_fixed_reply(text, self._cancel_event),
+                name="fixed-reply",
             )
 
     async def _abort_reply(self, next_state: State = State.ENGAGED) -> None:
@@ -377,3 +507,44 @@ class Orchestrator:
                     self._reply_task = None
                     self._reply_started_at = 0.0
                     self._reply_barge_in_count = 0
+
+    async def _run_fixed_reply(self, text: str, cancel_event: asyncio.Event) -> None:
+        log.info("Fixed reply START text=%r", text)
+        try:
+            async for pcm in self._tts.synthesize(text, cancel_event):
+                if cancel_event.is_set():
+                    break
+                await self._queue_pcm(pcm)
+            if not cancel_event.is_set() and self._tts_audio_started:
+                await self._sender.flush()
+            total_s = (
+                time.monotonic() - self._reply_started_at
+                if self._reply_started_at
+                else 0.0
+            )
+            log.info(
+                "Fixed reply DONE cancelled=%s total_latency=%.2fs spoke_audio=%s",
+                cancel_event.is_set(),
+                total_s,
+                self._tts_audio_started,
+            )
+        except asyncio.CancelledError:
+            log.info("Fixed reply task cancelled")
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("Fixed reply task crashed: %s", e)
+        finally:
+            if self._state == State.SPEAKING and not cancel_event.is_set():
+                async with self._state_lock:
+                    self._tts_audio_started = False
+                    self._tts_started_at = 0.0
+                    self._engaged_last_active_at = time.monotonic()
+                    self._state = State.ENGAGED
+                    self._reply_task = None
+                    self._reply_started_at = 0.0
+                    self._reply_barge_in_count = 0
+
+    def _wake_ack_text(self, source_text: str) -> str:
+        if _contains_cjk(source_text):
+            return CFG.agent.wake_ack_tts_text_zh
+        return CFG.agent.wake_ack_tts_text_en

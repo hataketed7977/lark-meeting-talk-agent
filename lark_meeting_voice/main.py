@@ -28,6 +28,7 @@ from lark_meeting_voice.config import CFG
 from lark_meeting_voice.lark.bot_join import (
     LarkAPIError,
     bot_join_meeting,
+    bot_leave_meeting,
     get_realtime_endpoint,
 )
 from lark_meeting_voice.lark.realtime import RealtimeClient
@@ -69,18 +70,18 @@ async def _resolve_ws_url(
     ws_url: str | None,
     meeting_id: str | None,
     meeting_no: str | None,
-) -> str:
+) -> tuple[str, str | None]:
     if ws_url:
         logging.info("Using ws-url supplied by caller")
-        return ws_url
+        return ws_url, meeting_id
     if meeting_id:
         logging.info(
             "Fetching realtime endpoint for existing meeting_id=%s", meeting_id
         )
-        return await get_realtime_endpoint(meeting_id)
+        return await get_realtime_endpoint(meeting_id), meeting_id
     assert meeting_no, "must provide one of --ws-url / --meeting-id / --meeting-no"
     mid, _ = await bot_join_meeting(meeting_no)
-    return await get_realtime_endpoint(mid)
+    return await get_realtime_endpoint(mid), mid
 
 
 async def _run(
@@ -113,8 +114,10 @@ async def _run(
     for attempt in range(1, max_attempts + 1):
         rt: RealtimeClient | None = None
         orch_task: asyncio.Task | None = None
+        current_meeting_id: str | None = None
+        recoverable: str | None = None
         try:
-            resolved_ws_url = await _resolve_ws_url(
+            resolved_ws_url, current_meeting_id = await _resolve_ws_url(
                 ws_url=ws_url,
                 meeting_id=meeting_id,
                 meeting_no=meeting_no,
@@ -124,7 +127,7 @@ async def _run(
             await rt.wait_session_created()
             logging.info("Realtime session ready; entering orchestrator loop")
 
-            orch = Orchestrator(rt)
+            orch = Orchestrator(rt, meeting_id=current_meeting_id)
             orch_task = asyncio.create_task(orch.run(), name=f"orchestrator-{attempt}")
             stop_task = asyncio.create_task(
                 stop_evt.wait(), name=f"stop-wait-{attempt}"
@@ -151,11 +154,21 @@ async def _run(
                     exc_info=exc,
                 )
             else:
-                logging.warning(
-                    "Realtime session ended unexpectedly on attempt %d/%d",
-                    attempt,
-                    max_attempts,
-                )
+                recoverable = rt.recoverable_fatal_error if rt is not None else None
+                if recoverable:
+                    logging.warning(
+                        "Realtime session ended due to recoverable error=%s "
+                        "on attempt %d/%d",
+                        recoverable,
+                        attempt,
+                        max_attempts,
+                    )
+                else:
+                    logging.warning(
+                        "Realtime session ended unexpectedly on attempt %d/%d",
+                        attempt,
+                        max_attempts,
+                    )
         except Exception as exc:  # noqa: BLE001
             logging.error(
                 "Realtime session setup failed on attempt %d/%d: %r",
@@ -178,6 +191,22 @@ async def _run(
                     await orch_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if (
+                recoverable == "stale_stream_publish_session"
+                and meeting_no
+                and current_meeting_id
+            ):
+                logging.warning(
+                    "Forcing bot leave after stale publish conflict before retry: "
+                    "meeting_id=%s",
+                    current_meeting_id,
+                )
+                try:
+                    await bot_leave_meeting(current_meeting_id)
+                except Exception as exc:  # noqa: BLE001
+                    logging.warning("Forced bot leave failed: %s", exc)
+                else:
+                    await asyncio.sleep(1.5)
 
         if stop_evt.is_set() or attempt >= max_attempts:
             break

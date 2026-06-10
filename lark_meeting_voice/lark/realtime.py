@@ -108,10 +108,16 @@ class RealtimeClient:
         self._session_created_time: float = 0.0
         # Rate-limit repetitive server errors (e.g. stale-publish 1001 flood).
         self._err_seen: dict[tuple[int, str], int] = {}
+        self._recoverable_fatal_error: Optional[str] = None
+        self._fatal_close_started = False
 
     @property
     def session_id(self) -> int:
         return self._session_id
+
+    @property
+    def recoverable_fatal_error(self) -> Optional[str]:
+        return self._recoverable_fatal_error
 
     async def connect(self) -> None:
         log.info("Connecting Realtime WS %s", self._ws_url)
@@ -208,6 +214,14 @@ class RealtimeClient:
             pass
         if self._recv_task:
             self._recv_task.cancel()
+
+    async def _close_due_to_recoverable_error(self, kind: str) -> None:
+        if self._fatal_close_started:
+            return
+        self._fatal_close_started = True
+        self._recoverable_fatal_error = kind
+        log.warning("Closing realtime session due to recoverable error=%s", kind)
+        await self.close(reason="CLIENT_ERROR")
 
     async def downstream(self) -> AsyncIterator[DownstreamAudio]:
         while not self._closed.is_set():
@@ -385,6 +399,11 @@ class RealtimeClient:
                     "session exists per bot identity, or use a separate bot.",
                     err.details.get("current", "?"),
                     err.details.get("incoming", self._session_id),
+                )
+                asyncio.create_task(
+                    self._close_due_to_recoverable_error(
+                        "stale_stream_publish_session"
+                    )
                 )
         else:
             log.warning(
