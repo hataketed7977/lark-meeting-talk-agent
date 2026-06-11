@@ -97,9 +97,7 @@ class TTSConfig:
         "https://openspeech.bytedance.com/api/v3/tts/unidirectional",
     )
     resource_id: str = os.getenv("VOLC_TTS_RESOURCE_ID", "seed-tts-2.0")
-    voice_type: str = os.getenv(
-        "VOLC_TTS_VOICE_TYPE", "zh_male_m191_uranus_bigtts"
-    )
+    voice_type: str = os.getenv("VOLC_TTS_VOICE_TYPE", "zh_male_m191_uranus_bigtts")
     sample_rate: int = 24000
     connect_timeout_s: float = float(os.getenv("VOLC_TTS_CONNECT_TIMEOUT_S", "10"))
     stream_idle_timeout_s: float = float(
@@ -131,6 +129,16 @@ class AgentConfig:
         )
     )
     engaged_idle_timeout_s: float = float(os.getenv("ENGAGED_IDLE_TIMEOUT_S", "0"))
+    asr_soft_final_quiet_window_s: float = float(
+        os.getenv("ASR_SOFT_FINAL_QUIET_WINDOW_S", "0.8")
+    )
+    asr_soft_final_min_chars: int = int(os.getenv("ASR_SOFT_FINAL_MIN_CHARS", "8"))
+    engaged_asr_soft_final_quiet_window_s: float = float(
+        os.getenv("ENGAGED_ASR_SOFT_FINAL_QUIET_WINDOW_S", "0.5")
+    )
+    engaged_asr_soft_final_min_chars: int = int(
+        os.getenv("ENGAGED_ASR_SOFT_FINAL_MIN_CHARS", "6")
+    )
     memory_recent_utterances: int = int(os.getenv("MEMORY_RECENT_UTTERANCES", "50"))
     memory_summary_items: int = int(os.getenv("MEMORY_SUMMARY_ITEMS", "8"))
     memory_context_recent_utterances: int = int(

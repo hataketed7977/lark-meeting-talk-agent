@@ -113,6 +113,7 @@ async def _run(
 
     for attempt in range(1, max_attempts + 1):
         rt: RealtimeClient | None = None
+        orch: Orchestrator | None = None
         orch_task: asyncio.Task | None = None
         current_meeting_id: str | None = None
         recoverable: str | None = None
@@ -153,6 +154,9 @@ async def _run(
                     exc,
                     exc_info=exc,
                 )
+            elif orch is not None and orch.exit_reason == "meeting_ended":
+                logging.info("Meeting ended; exiting without retry")
+                return 0
             else:
                 recoverable = rt.recoverable_fatal_error if rt is not None else None
                 if recoverable:

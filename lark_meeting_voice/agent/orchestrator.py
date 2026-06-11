@@ -88,6 +88,10 @@ def _is_low_value_query(text: str) -> bool:
     return len(words) == 1 and words[0] in _LOW_VALUE_QUERY_WORDS
 
 
+def _final_key(text: str) -> str:
+    return " ".join((text or "").strip().lower().split())
+
+
 class State(str, enum.Enum):
     WAITING = "waiting"
     ENGAGED = "engaged"
@@ -137,6 +141,19 @@ class Orchestrator:
         self._engaged_last_active_at: float = 0.0
         self._event_consumers: CurrentMeetingEventConsumers | None = None
         self._artifact_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        self._shutdown_requested = asyncio.Event()
+        self._exit_reason: str | None = None
+        self._soft_final_task: Optional[asyncio.Task] = None
+        self._latest_partial: str = ""
+        self._latest_partial_key: str = ""
+        self._pending_soft_final_key: str | None = None
+        self._turn_started_at: float = 0.0
+        self._latest_partial_started_at: float = 0.0
+        self._current_reply_turn_started_at: float = 0.0
+
+    @property
+    def exit_reason(self) -> str | None:
+        return self._exit_reason
 
     async def run(self) -> None:
         if self._meeting_id:
@@ -175,10 +192,13 @@ class Orchestrator:
 
         try:
             while not self._rt._closed.is_set():  # type: ignore[attr-defined]
+                if self._shutdown_requested.is_set():
+                    break
                 await asyncio.sleep(0.5)
                 await self._maybe_expire_engaged_session()
         finally:
             pump_task.cancel()
+            self._cancel_soft_final_task()
             if self._event_consumers is not None:
                 await self._event_consumers.stop()
             for task in self._artifact_tasks.values():
@@ -231,9 +251,14 @@ class Orchestrator:
     # ---------------- ASR callbacks ----------------
 
     async def _on_partial(self, text: str) -> None:
+        text = " ".join((text or "").strip().split())
         log.debug("ASR partial: %s", text)
-        if self._state != State.SPEAKING:
+        if not text:
             return
+        if self._state != State.SPEAKING:
+            self._schedule_soft_final(text)
+            return
+        self._cancel_soft_final_task()
         # Gate barge-in: ignore partials until TTS has actually started
         # speaking AND we've been audible for at least MIN_REPLY_AUDIBLE_S.
         # This swallows the tail of the user's wake utterance and prevents
@@ -260,19 +285,154 @@ class Orchestrator:
         await self._abort_reply(next_state=State.ENGAGED)
 
     async def _on_final(self, text: str) -> None:
-        log.info("ASR final: %s", text)
+        await self._handle_final(text, source="asr_final")
+
+    def _cancel_soft_final_task(self) -> None:
+        task = self._soft_final_task
+        self._soft_final_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def _clear_partial_tracking(self) -> None:
+        self._latest_partial = ""
+        self._latest_partial_key = ""
+        self._latest_partial_started_at = 0.0
+
+    def _soft_final_policy(self) -> tuple[float, int]:
+        if self._state == State.ENGAGED:
+            return (
+                CFG.agent.engaged_asr_soft_final_quiet_window_s,
+                CFG.agent.engaged_asr_soft_final_min_chars,
+            )
+        return (
+            CFG.agent.asr_soft_final_quiet_window_s,
+            CFG.agent.asr_soft_final_min_chars,
+        )
+
+    def _should_soft_finalize(self, text: str) -> bool:
+        if self._state not in {State.WAITING, State.ENGAGED}:
+            return False
+        _, min_chars = self._soft_final_policy()
+        if len(text) < min_chars:
+            return False
+        if _is_low_value_query(text):
+            return False
+        if self._state == State.WAITING and not self._wake.is_wake(text):
+            return False
+        return True
+
+    def _mark_turn_activity(self, text: str) -> None:
+        now = time.monotonic()
+        key = _final_key(text)
+        if not self._turn_started_at:
+            self._turn_started_at = now
+            log.info("Turn activity started state=%s text=%r", self._state.value, text)
+        if key != self._latest_partial_key:
+            self._latest_partial_started_at = now
+
+    def _schedule_soft_final(self, text: str) -> None:
+        if not self._should_soft_finalize(text):
+            return
+        self._mark_turn_activity(text)
+        self._latest_partial = text
+        self._latest_partial_key = _final_key(text)
+        self._cancel_soft_final_task()
+        quiet_window_s, min_chars = self._soft_final_policy()
+        self._soft_final_task = asyncio.create_task(
+            self._emit_soft_final_after_quiet_window(
+                self._latest_partial_key,
+                text,
+                quiet_window_s,
+                min_chars,
+            ),
+            name="soft-final",
+        )
+
+    async def _emit_soft_final_after_quiet_window(
+        self,
+        expected_key: str,
+        text: str,
+        quiet_window_s: float,
+        min_chars: int,
+    ) -> None:
+        try:
+            await asyncio.sleep(quiet_window_s)
+            if self._latest_partial_key != expected_key or self._latest_partial != text:
+                return
+            current_quiet_window_s, current_min_chars = self._soft_final_policy()
+            if (
+                current_quiet_window_s != quiet_window_s
+                or current_min_chars != min_chars
+                or not self._should_soft_finalize(text)
+            ):
+                return
+            self._pending_soft_final_key = expected_key
+            self._soft_final_task = None
+            partial_age_s = (
+                time.monotonic() - self._latest_partial_started_at
+                if self._latest_partial_started_at
+                else 0.0
+            )
+            log.info(
+                "ASR soft final state=%s quiet_window=%.2fs min_chars=%d partial_age=%.2fs text=%s",
+                self._state.value,
+                quiet_window_s,
+                min_chars,
+                partial_age_s,
+                text,
+            )
+            await self._handle_final(text, source="soft_final")
+        except asyncio.CancelledError:
+            raise
+
+    async def _handle_final(self, text: str, *, source: str) -> None:
+        text = " ".join((text or "").strip().split())
+        if not text:
+            return
+        key = _final_key(text)
+        if source == "asr_final" and self._pending_soft_final_key == key:
+            log.info("Ignoring duplicate ASR final after soft final: %s", text)
+            self._pending_soft_final_key = None
+            self._clear_partial_tracking()
+            self._cancel_soft_final_task()
+            return
+        if source != "soft_final":
+            self._pending_soft_final_key = None
+        if source == "asr_final":
+            self._mark_turn_activity(text)
+        turn_latency_s = (
+            time.monotonic() - self._turn_started_at if self._turn_started_at else 0.0
+        )
+        partial_age_s = (
+            time.monotonic() - self._latest_partial_started_at
+            if self._latest_partial_started_at
+            else 0.0
+        )
+        self._clear_partial_tracking()
+        self._cancel_soft_final_task()
+        log.info(
+            "Turn committed source=%s state=%s turn_latency=%.2fs partial_age=%.2fs text=%s",
+            source,
+            self._state.value,
+            turn_latency_s,
+            partial_age_s,
+            text,
+        )
 
         if self._state == State.WAITING:
             if not self._wake.is_wake(text):
                 self._remember_transcript(text, source="meeting_passive_asr")
+                self._turn_started_at = 0.0
                 return
             await self._enter_engaged()
             query = self._wake.strip_wake(text).strip()
             if not query:
                 await self._spawn_fixed_reply(self._wake_ack_text(text))
+                self._turn_started_at = 0.0
                 return
             if _is_low_value_query(query):
                 log.info("Ignoring low-value wake query=%r", query)
+                self._turn_started_at = 0.0
                 return
             self._remember_transcript(query, source="user_query")
             await self._spawn_reply(query)
@@ -284,11 +444,13 @@ class Orchestrator:
         if self._end_session.is_stop(text):
             log.info("End-session intent detected -> WAITING")
             await self._enter_waiting()
+            self._turn_started_at = 0.0
             return
 
         if self._stop.is_stop(text):
             log.info("STOP intent -> stay engaged silently")
             await self._enter_engaged()
+            self._turn_started_at = 0.0
             return
 
         await self._enter_engaged()
@@ -300,9 +462,12 @@ class Orchestrator:
         if query:
             if _is_low_value_query(query):
                 log.info("Ignoring low-value follow-up query=%r", query)
+                self._turn_started_at = 0.0
                 return
             self._remember_transcript(query, source="user_query")
             await self._spawn_reply(query)
+            return
+        self._turn_started_at = 0.0
 
     async def _on_asr_error(self, msg: str) -> None:
         log.warning("ASR error: %s", msg)
@@ -319,6 +484,13 @@ class Orchestrator:
                 sorted(event.payload.keys()),
             )
             self._schedule_artifact_fetches()
+        if event.event_key == "vc.meeting.participant_meeting_ended_v1":
+            log.info("Current meeting ended -> graceful shutdown")
+            self._exit_reason = "meeting_ended"
+            self._shutdown_requested.set()
+            self._cancel_soft_final_task()
+            self._clear_partial_tracking()
+            await self._enter_waiting()
 
     def _schedule_artifact_fetches(self) -> None:
         for artifact in self._memory.pending_artifacts():
@@ -402,9 +574,15 @@ class Orchestrator:
             if not self._tts_audio_started:
                 self._tts_audio_started = True
                 self._tts_started_at = time.monotonic()
+                turn_to_first_audio_s = (
+                    self._tts_started_at - self._current_reply_turn_started_at
+                    if self._current_reply_turn_started_at
+                    else 0.0
+                )
                 log.info(
-                    "TTS audio started — first_audio_latency=%.2fs",
+                    "TTS audio started — first_audio_latency=%.2fs turn_to_first_audio=%.2fs",
                     self._tts_started_at - self._reply_started_at,
+                    turn_to_first_audio_s,
                 )
             await self._sender.feed(chunk)
 
@@ -438,6 +616,10 @@ class Orchestrator:
     async def _spawn_reply(self, query: str) -> None:
         async with self._state_lock:
             await self._abort_reply_locked(next_state=State.ENGAGED)
+            self._cancel_soft_final_task()
+            self._clear_partial_tracking()
+            self._current_reply_turn_started_at = self._turn_started_at
+            self._turn_started_at = 0.0
             self._cancel_event = asyncio.Event()
             self._tts_audio_started = False
             self._tts_started_at = 0.0
@@ -453,6 +635,10 @@ class Orchestrator:
     async def _spawn_fixed_reply(self, text: str) -> None:
         async with self._state_lock:
             await self._abort_reply_locked(next_state=State.ENGAGED)
+            self._cancel_soft_final_task()
+            self._clear_partial_tracking()
+            self._current_reply_turn_started_at = self._turn_started_at
+            self._turn_started_at = 0.0
             self._cancel_event = asyncio.Event()
             self._tts_audio_started = False
             self._tts_started_at = 0.0
@@ -491,6 +677,7 @@ class Orchestrator:
         self._reply_task = None
         self._tts_audio_started = False
         self._tts_started_at = 0.0
+        self._current_reply_turn_started_at = 0.0
         self._state = next_state
 
     async def _run_reply(self, query: str, cancel_event: asyncio.Event) -> None:
