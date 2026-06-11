@@ -72,7 +72,13 @@ Alternative forms supported by the code:
 
 ### Leave A Meeting
 
-If the user asks the bot to leave a meeting, prefer the dedicated leave entrypoint:
+If the active bot process was started by this repository, prefer graceful process
+shutdown rather than the standalone leave command. The main process now sends
+`session.close` and then calls `bots/leave` for meetings it joined with
+`--meeting-no`.
+
+Use the dedicated leave entrypoint only when there is no active local bot process,
+or when you have a known `meeting_id` that must be cleaned up:
 
 ```bash
 .venv/bin/python -u -m lark_meeting_voice.leave --meeting-no <meeting_no>
@@ -84,6 +90,10 @@ Or:
 .venv/bin/python -u -m lark_meeting_voice.leave --meeting-id <meeting_id>
 ```
 
+Avoid using `leave --meeting-no` as the normal stop path: it must call
+`bots/join` first to resolve the internal `meeting_id`, which can perturb the
+meeting-side bot state.
+
 ### Stop The Current Bot Process
 
 If a meeting bot is already running in a terminal, stop that command before starting a replacement process. Avoid multiple competing bot processes for the same meeting.
@@ -91,18 +101,32 @@ If a meeting bot is already running in a terminal, stop that command before star
 Mandatory restart pattern:
 
 1. Check whether a prior bot process is still running
-2. Stop the prior bot process cleanly
-3. Explicitly leave the meeting with `.venv/bin/python -u -m lark_meeting_voice.leave --meeting-no <meeting_no>` or the `meeting_id` form before rejoining
+2. Send SIGTERM to the real Python bot process, not the Trae/zsh wrapper
+3. Wait for logs showing `Signal received, shutting down`,
+   `Leaving meeting joined by this process`, and `Bot left meeting id=...`
 4. Confirm there is no remaining `python -u -m lark_meeting_voice` process for the same meeting number
 5. Start exactly one fresh bot process
 6. Verify readiness logs before telling the user the bot is ready
 
-Do not skip the leave step when the user asks to "restart", "retry", or "rejoin". In this project, restart means `stop -> leave -> verify single-process-zero -> start one new join`.
+Do not kill the outer Trae sandbox or zsh wrapper as the primary stop method.
+If the Python bot does not get to run its `finally` block, the Realtime session
+or meeting bot state may be left behind and the next join can show symptoms such
+as `rx_audio=1` after `session.created`.
+
+In this project, restart means:
+
+`SIGTERM Python bot -> wait for session.close + bots/leave -> verify single-process-zero -> start one new join`.
 
 Recommended verification command before and after restart:
 
 ```bash
 pgrep -fl "python -u -m lark_meeting_voice"
+```
+
+Recommended graceful stop command:
+
+```bash
+pkill -TERM -f "/Python .* -u -m lark_meeting_voice --meeting-no <meeting_no>"
 ```
 
 If more than one bot process is visible for the same meeting, treat that as an operational error and clean it up before proceeding.

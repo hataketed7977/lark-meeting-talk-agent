@@ -33,13 +33,18 @@ _CLI_SIGNAL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _LARK_SIGNAL_PATTERN = re.compile(
-    r"(\blark\b|\blarkcli\b|\blark-cli\b|\bluck\b|飞书)",
+    r"(\blark\b|\blarkcli\b|\blark-cli\b|\bluck\b|\bluxa?\b|飞书)",
     re.IGNORECASE,
 )
 _LARK_CLI_COMBINED_ALIAS_PATTERN = re.compile(
     r"(\blark[\s-]?cli\b|\bluck[\s-]?cli\b)",
     re.IGNORECASE,
 )
+_LARK_CLI_ASR_ALIAS_PATTERN = re.compile(
+    r"\b(?:luxa?|lucks|lax|luck|lark)[\s.,]+(?:c[\s.,]+)?l[\s.,]*i\b\.?",
+    re.IGNORECASE,
+)
+_SPELLED_CLI_PATTERN = re.compile(r"\bc[\s.,]+l[\s.,]*i\b\.?", re.IGNORECASE)
 
 
 def _collapse_spelled_letters(text: str) -> str:
@@ -51,6 +56,8 @@ def _collapse_spelled_letters(text: str) -> str:
 
 def _normalize_brand_aliases(text: str) -> str:
     normalized = text
+    normalized = _LARK_CLI_ASR_ALIAS_PATTERN.sub("lark cli", normalized)
+    normalized = _SPELLED_CLI_PATTERN.sub("cli", normalized)
     normalized = re.sub(
         r"\bluck[\s-]?cli\b", "lark cli", normalized, flags=re.IGNORECASE
     )

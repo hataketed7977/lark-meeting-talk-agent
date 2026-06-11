@@ -215,36 +215,38 @@ async def _run(
                 "Setup failure is treated as transient; retrying if attempts remain"
             )
         finally:
-            if rt is not None:
-                await rt.close(reason="USER_LEFT")
             if orch_task is not None:
                 orch_task.cancel()
                 try:
                     await orch_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if rt is not None:
+                await rt.close(reason="USER_LEFT")
             if recoverable in recoverable_leave_delays and orch is not None:
                 retained_memory = orch.memory
                 retained_meeting_id = current_meeting_id
             elif recoverable is None:
                 retained_memory = None
                 retained_meeting_id = None
-            if (
-                recoverable in recoverable_leave_delays
-                and meeting_no
-                and current_meeting_id
-            ):
-                logging.warning(
-                    "Forcing bot leave after recoverable error=%s before retry: "
-                    "meeting_id=%s",
-                    recoverable,
-                    current_meeting_id,
-                )
+            if meeting_no and current_meeting_id:
+                if recoverable in recoverable_leave_delays:
+                    logging.warning(
+                        "Forcing bot leave after recoverable error=%s before retry: "
+                        "meeting_id=%s",
+                        recoverable,
+                        current_meeting_id,
+                    )
+                else:
+                    logging.info(
+                        "Leaving meeting joined by this process: meeting_id=%s",
+                        current_meeting_id,
+                    )
                 try:
                     await bot_leave_meeting(current_meeting_id)
                 except Exception as exc:  # noqa: BLE001
-                    logging.warning("Forced bot leave failed: %s", exc)
-                else:
+                    logging.warning("Bot leave failed: %s", exc)
+                if recoverable in recoverable_leave_delays:
                     await asyncio.sleep(recoverable_leave_delays[recoverable])
 
         if stop_evt.is_set():

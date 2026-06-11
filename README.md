@@ -99,6 +99,40 @@ python -m lark_meeting_voice --meeting-id 7642440384966134751
 python -m lark_meeting_voice --ws-url 'wss://...'
 ```
 
+### 5. Stop Or Restart Gracefully
+
+When the process was started with `--meeting-no`, the main bot process owns both
+the Realtime session and the VC bot membership. Stop the real Python bot process
+with `SIGTERM` so it can run its cleanup path:
+
+```bash
+pkill -TERM -f "/Python .* -u -m lark_meeting_voice --meeting-no 123456789"
+```
+
+Expected shutdown logs include:
+
+```text
+Signal received, shutting down
+TX session.close
+Leaving meeting joined by this process
+Bot left meeting id=...
+```
+
+Avoid killing the outer terminal wrapper or Trae sandbox process as the primary
+stop method. If the Python process does not get to run cleanup, the next join may
+inherit stale meeting or Realtime state, including a downstream stream that stops
+after the first audio frame.
+
+The standalone leave command is for cleanup when no local bot process is active,
+or when you already know the internal meeting id:
+
+```bash
+python -m lark_meeting_voice.leave --meeting-id 7642440384966134751
+```
+
+Avoid using `leave --meeting-no` as the normal stop path because resolving a
+meeting number requires joining first and can perturb the meeting-side bot state.
+
 ## Wake And Conversation Behavior
 
 - `WAITING`: ASR runs continuously and meeting memory is updated, but the bot does not speak.

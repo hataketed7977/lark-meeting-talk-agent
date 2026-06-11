@@ -131,3 +131,54 @@ def test_sdk_silence_keepalive_does_not_flood_recent_audio(monkeypatch):
         assert ws.sent == []
 
     asyncio.run(run())
+
+
+def test_sdk_fallback_dispatches_utterance_additions_text():
+    async def run() -> None:
+        partials: list[str] = []
+
+        async def on_partial(text: str) -> None:
+            partials.append(text)
+
+        asr = SDKVolcASR(on_partial=on_partial)
+        await asr._dispatch_fallback_result(  # noqa: SLF001
+            {"is_last_package": False},
+            {
+                "additions": {"log_id": "log"},
+                "utterances": [
+                    {
+                        "additions": {"text": "How do you feel about this meeting?"},
+                        "definite": False,
+                    }
+                ],
+            },
+        )
+
+        assert partials == ["How do you feel about this meeting?"]
+
+    asyncio.run(run())
+
+
+def test_sdk_fallback_dispatches_definite_utterance_as_final():
+    async def run() -> None:
+        finals: list[str] = []
+
+        async def on_final(text: str) -> None:
+            finals.append(text)
+
+        asr = SDKVolcASR(on_final=on_final)
+        await asr._dispatch_fallback_result(  # noqa: SLF001
+            {"is_last_package": False},
+            {
+                "utterances": [
+                    {
+                        "additions": {"text": "The final answer."},
+                        "definite": True,
+                    }
+                ],
+            },
+        )
+
+        assert finals == ["The final answer."]
+
+    asyncio.run(run())

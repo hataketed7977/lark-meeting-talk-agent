@@ -304,7 +304,7 @@ class SDKVolcASR:
                     if self._on_error:
                         await self._on_error(f"asr_error:{code}")
                     continue
-                package = self._coerce_package(parsed)
+                package = await self._coerce_package(parsed)
                 if package is None:
                     continue
                 await self._dispatch_package(package)
@@ -313,7 +313,7 @@ class SDKVolcASR:
         finally:
             self._closed.set()
 
-    def _coerce_package(
+    async def _coerce_package(
         self, parsed: dict[str, Any]
     ) -> ListenBidirectionPackage | None:
         message = parsed.get("message")
@@ -337,12 +337,52 @@ class SDKVolcASR:
                 }
             )
         except ValidationError:
+            await self._dispatch_fallback_result(parsed, result)
             log.info(
                 "ASR SDK unsupported payload keys=%s message_keys=%s",
                 sorted(result.keys()),
                 sorted(message.keys()),
             )
             return None
+
+    async def _dispatch_fallback_result(
+        self, parsed: dict[str, Any], result: dict[str, Any]
+    ) -> None:
+        text = str(result.get("text") or "").strip()
+        utterances = result.get("utterances")
+        if isinstance(utterances, list):
+            definite_texts: list[str] = []
+            loose_texts: list[str] = []
+            for utterance in utterances:
+                if not isinstance(utterance, dict):
+                    continue
+                utterance_text = str(utterance.get("text") or "").strip()
+                if not utterance_text:
+                    additions = utterance.get("additions")
+                    if isinstance(additions, dict):
+                        utterance_text = str(additions.get("text") or "").strip()
+                if not utterance_text:
+                    continue
+                loose_texts.append(utterance_text)
+                if utterance.get("definite"):
+                    definite_texts.append(utterance_text)
+            if definite_texts:
+                text = "".join(definite_texts).strip()
+                if text and self._on_final:
+                    await self._on_final(text)
+                return
+            if not text and loose_texts:
+                text = " ".join(loose_texts).strip()
+        if not text:
+            return
+        if parsed.get("is_last_package"):
+            if self._on_final:
+                await self._on_final(text)
+            return
+        if text != self._last_partial:
+            self._last_partial = text
+            if self._on_partial:
+                await self._on_partial(text)
 
     def _log_ignored_payload(
         self,

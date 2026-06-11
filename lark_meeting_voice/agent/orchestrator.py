@@ -118,6 +118,26 @@ def _is_low_value_query(text: str) -> bool:
     return len(words) == 1 and words[0] in _LOW_VALUE_QUERY_WORDS
 
 
+_INCOMPLETE_ENGLISH_TAIL_PATTERNS = (
+    re.compile(r"\b(how do you feel about|what do you think about)$", re.IGNORECASE),
+    re.compile(r"\b(my question is|the question is|i mean|i want|i want to)$", re.IGNORECASE),
+    re.compile(r"\b(can you help me to|could you help me to|help me to)$", re.IGNORECASE),
+    re.compile(
+        r"\b(about|because|for|from|if|is|of|or|so|that|the|to|with)$",
+        re.IGNORECASE,
+    ),
+)
+
+
+def _has_incomplete_english_tail(text: str) -> bool:
+    if _contains_cjk(text):
+        return False
+    normalized = re.sub(r"[^a-z']+", " ", (text or "").lower()).strip()
+    if not normalized:
+        return False
+    return any(pattern.search(normalized) for pattern in _INCOMPLETE_ENGLISH_TAIL_PATTERNS)
+
+
 def _final_key(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
 
@@ -412,6 +432,8 @@ class Orchestrator:
         if len(text) < min_chars:
             return False
         if _is_low_value_query(text):
+            return False
+        if _has_incomplete_english_tail(text):
             return False
         if self._state == State.WAITING and not self._wake.is_wake(text):
             return False
