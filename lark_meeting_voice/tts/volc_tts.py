@@ -25,7 +25,7 @@ import logging
 import struct
 import uuid
 from json import JSONDecodeError
-from typing import Any, AsyncIterator, Dict, Iterator, List, Tuple
+from typing import Any, AsyncIterator, Dict, List, Tuple
 
 import aiohttp
 import websockets
@@ -51,11 +51,18 @@ SERVER_ERROR = 0b1111
 START_CONNECTION_EVENT = 1
 FINISH_CONNECTION_EVENT = 2
 CONNECTION_STARTED_EVENT = 50
+CONNECTION_FAILED_EVENT = 51
+CONNECTION_FINISHED_EVENT = 52
 START_SESSION_EVENT = 100
+SESSION_CANCELED_EVENT = 151
 FINISH_SESSION_EVENT = 102
 SESSION_STARTED_EVENT = 150
 SESSION_FINISHED_EVENT = 152
+SESSION_FAILED_EVENT = 153
 TASK_REQUEST_EVENT = 200
+TTS_SENTENCE_START_EVENT = 350
+TTS_SENTENCE_END_EVENT = 351
+TTS_RESPONSE_EVENT = 352
 
 # V3 request/response frames include an event number in the optional header.
 WITH_EVENT = 0b0100
@@ -159,6 +166,57 @@ def _header(
     return bytes([b0, b1, b2, 0])
 
 
+def _json_payload(payload: dict[str, object]) -> bytes:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
+        "utf-8"
+    )
+
+
+def _sized_bytes(data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + data
+
+
+def _build_ws_v3_frame(
+    event: int,
+    payload: dict[str, object],
+    *,
+    session_id: str | None = None,
+) -> bytes:
+    body = _json_payload(payload)
+    frame = _header(
+        FULL_CLIENT_REQUEST,
+        flags=WITH_EVENT,
+        serialization=SERIALIZATION_JSON,
+        compression=COMPRESSION_NONE,
+    ) + struct.pack(">I", event)
+    if session_id is not None:
+        frame += _sized_bytes(session_id.encode("utf-8"))
+    return frame + _sized_bytes(body)
+
+
+def _read_sized_bytes(data: bytes, cursor: int) -> tuple[bytes, int] | None:
+    if cursor + 4 > len(data):
+        return None
+    size = struct.unpack(">I", data[cursor : cursor + 4])[0]
+    cursor += 4
+    if size < 0 or cursor + size > len(data):
+        return None
+    return data[cursor : cursor + size], cursor + size
+
+
+def _decode_ws_v3_payload(
+    payload: bytes, serialization: int, compression: int
+) -> object:
+    if compression == COMPRESSION_GZIP and payload:
+        payload = gzip.decompress(payload)
+    if serialization == SERIALIZATION_JSON and payload:
+        try:
+            return json.loads(payload.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {"_raw": payload}
+    return payload
+
+
 class VolcTTS:
     def __init__(self) -> None:
         self._send_lock = asyncio.Lock()
@@ -208,14 +266,10 @@ class VolcTTS:
         ws: Any,
         event: int,
         payload: dict[str, object],
+        *,
+        session_id: str | None = None,
     ) -> None:
-        body = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
-        frame = (
-            _header(FULL_CLIENT_REQUEST, flags=WITH_EVENT)
-            + struct.pack(">I", event)
-            + struct.pack(">I", len(body))
-            + body
-        )
+        frame = _build_ws_v3_frame(event, payload, session_id=session_id)
         async with self._send_lock:
             await asyncio.wait_for(ws.send(frame), timeout=CFG.tts.connect_timeout_s)
 
@@ -224,7 +278,7 @@ class VolcTTS:
         ws: Any,
         expected_event: int,
         cancel_event: asyncio.Event,
-    ) -> None:
+    ) -> str:
         while True:
             if cancel_event.is_set():
                 raise asyncio.CancelledError()
@@ -242,13 +296,23 @@ class VolcTTS:
                     f"TTS WS V3 error code={parsed.get('code')} payload={parsed.get('payload')}"
                 )
             if parsed["kind"] == "control" and parsed.get("event") == expected_event:
-                return
+                return str(
+                    parsed.get("connection_id") or parsed.get("session_id") or ""
+                )
+            if parsed["kind"] == "control" and parsed.get("event") in {
+                CONNECTION_FAILED_EVENT,
+                SESSION_FAILED_EVENT,
+            }:
+                raise RuntimeError(
+                    f"TTS WS V3 failed event={parsed.get('event')} payload={parsed.get('payload')}"
+                )
 
     async def _send_ws_v3_text(
         self,
         ws: Any,
         text_stream: AsyncIterator[str],
         cancel_event: asyncio.Event,
+        session_id: str,
     ) -> None:
         async for text in text_stream:
             if cancel_event.is_set():
@@ -259,11 +323,13 @@ class VolcTTS:
                 ws,
                 TASK_REQUEST_EVENT,
                 _build_v3_task_payload(text),
+                session_id=session_id,
             )
         await self._send_ws_v3_event(
             ws,
             FINISH_SESSION_EVENT,
             _build_v3_control_payload(FINISH_SESSION_EVENT),
+            session_id=session_id,
         )
 
     async def _synthesize_ws_v3(
@@ -272,6 +338,7 @@ class VolcTTS:
         cancel_event: asyncio.Event,
     ) -> AsyncIterator[bytes]:
         connect_id = str(uuid.uuid4())
+        session_id = uuid.uuid4().hex
         headers = _build_ws_v3_headers(connect_id)
         ws = await websockets.connect(
             CFG.tts.ws_url,
@@ -298,15 +365,20 @@ class VolcTTS:
                 START_CONNECTION_EVENT,
                 _build_v3_control_payload(START_CONNECTION_EVENT),
             )
-            await self._await_ws_v3_event(ws, CONNECTION_STARTED_EVENT, cancel_event)
+            server_connect_id = await self._await_ws_v3_event(
+                ws, CONNECTION_STARTED_EVENT, cancel_event
+            )
+            if server_connect_id:
+                log.debug("TTS WS V3 server connection_id=%s", server_connect_id)
             await self._send_ws_v3_event(
                 ws,
                 START_SESSION_EVENT,
                 _build_v3_session_payload(),
+                session_id=session_id,
             )
             await self._await_ws_v3_event(ws, SESSION_STARTED_EVENT, cancel_event)
             sender_task = asyncio.create_task(
-                self._send_ws_v3_text(ws, text_stream, cancel_event),
+                self._send_ws_v3_text(ws, text_stream, cancel_event, session_id),
                 name="tts-ws-v3-send",
             )
             while True:
@@ -648,37 +720,57 @@ def _parse_ws_v3_message(msg: object) -> dict[str, object]:
         payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
         cursor += 4
         payload = data[cursor : cursor + payload_size]
-        if compression == COMPRESSION_GZIP and payload:
-            try:
-                payload = gzip.decompress(payload)
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            decoded: object = json.loads(payload.decode("utf-8")) if payload else {}
-        except Exception:  # noqa: BLE001
-            decoded = payload
+        decoded = _decode_ws_v3_payload(payload, serialization, compression)
         return {"kind": "error", "event": event, "code": code, "payload": decoded}
 
-    if cursor + 4 > len(data):
-        return {"kind": "unknown", "event": event}
-    payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
-    cursor += 4
-    payload = data[cursor : cursor + payload_size]
+    connection_id = ""
+    session_id = ""
+    if event in {
+        CONNECTION_STARTED_EVENT,
+        CONNECTION_FINISHED_EVENT,
+        CONNECTION_FAILED_EVENT,
+    }:
+        field = _read_sized_bytes(data, cursor)
+        if field is not None:
+            raw_connection_id, cursor = field
+            connection_id = raw_connection_id.decode("utf-8", errors="replace")
+    elif event in {
+        SESSION_STARTED_EVENT,
+        SESSION_CANCELED_EVENT,
+        SESSION_FINISHED_EVENT,
+        SESSION_FAILED_EVENT,
+        TTS_SENTENCE_START_EVENT,
+        TTS_SENTENCE_END_EVENT,
+        TTS_RESPONSE_EVENT,
+    }:
+        field = _read_sized_bytes(data, cursor)
+        if field is not None:
+            raw_session_id, cursor = field
+            session_id = raw_session_id.decode("utf-8", errors="replace")
+
+    field = _read_sized_bytes(data, cursor)
+    if field is None:
+        return {
+            "kind": "unknown",
+            "event": event,
+            "connection_id": connection_id,
+            "session_id": session_id,
+        }
+    payload, _ = field
 
     if message_type == AUDIO_ONLY_RESPONSE:
-        return {"kind": "audio", "event": event, "audio": payload}
+        return {
+            "kind": "audio",
+            "event": event,
+            "session_id": session_id,
+            "audio": payload,
+        }
 
-    if compression == COMPRESSION_GZIP and payload:
-        payload = gzip.decompress(payload)
-    if serialization == SERIALIZATION_JSON and payload:
-        try:
-            decoded_payload: object = json.loads(payload.decode("utf-8"))
-        except Exception:  # noqa: BLE001
-            decoded_payload = {"_raw": payload}
-    else:
-        decoded_payload = payload
+    decoded_payload = _decode_ws_v3_payload(payload, serialization, compression)
     return {
         "kind": "control" if message_type == FULL_SERVER_RESPONSE else "unknown",
         "event": event,
+        "connection_id": connection_id,
+        "session_id": session_id,
         "payload": decoded_payload,
     }
