@@ -20,7 +20,10 @@ Public API:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
+import math
+import struct
 import time
 import uuid
 from dataclasses import dataclass
@@ -28,6 +31,7 @@ from datetime import datetime, timezone
 from typing import AsyncIterator, Optional
 
 import websockets
+from google.protobuf.json_format import MessageToDict
 
 from lark_meeting_voice._pb import frontier_pb2 as fr
 from lark_meeting_voice._pb import meeting_realtime_pb2 as mr
@@ -53,6 +57,65 @@ FRONTIER_CTRL_FRAME_TYPES = {2, 16, 32}  # IsAck, CursorKeyFrame, CursorDataFram
 SAMPLE_RATE = 24000
 AUDIO_TYPE = "audio/pcm"
 AUDIO_ENCODING = "s16le"
+RX_AUDIO_DIAG_INTERVAL_S = 5.0
+RAW_DUMP_PREVIEW_BYTES = 256
+
+
+def _pcm16_metrics(pcm: bytes) -> tuple[int, int]:
+    if len(pcm) < 2:
+        return 0, 0
+    sample_count = len(pcm) // 2
+    samples = struct.unpack("<" + "h" * sample_count, pcm[: sample_count * 2])
+    peak = max(abs(s) for s in samples) if samples else 0
+    rms = int(math.sqrt(sum(s * s for s in samples) / sample_count)) if samples else 0
+    return peak, rms
+
+
+def _proto_dict(msg: object) -> dict[str, object]:
+    try:
+        return MessageToDict(
+            msg,
+            preserving_proto_field_name=True,
+            use_integers_for_enums=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {"_error": str(e)}
+
+
+def _bytes_debug(data: bytes, *, limit: int = RAW_DUMP_PREVIEW_BYTES) -> dict[str, object]:
+    preview = data[:limit]
+    return {
+        "len": len(data),
+        "hex_prefix": preview.hex(),
+        "base64_prefix": base64.b64encode(preview).decode("ascii"),
+        "truncated": len(data) > limit,
+    }
+
+
+def _frame_debug_info(
+    frame: "fr.Frame | None",
+    *,
+    raw_frame: bytes | None = None,
+) -> dict[str, object]:
+    if frame is None:
+        return {}
+    info: dict[str, object] = {
+        "seq_id": frame.SeqID if frame.HasField("SeqID") else 0,
+        "log_id": str(frame.LogID),
+        "log_id_new": frame.LogIDNew if frame.HasField("LogIDNew") else "",
+        "msg_id": frame.msg_id if frame.HasField("msg_id") else "",
+        "service": frame.service if frame.HasField("service") else 0,
+        "method": frame.method if frame.HasField("method") else 0,
+        "frame_type": frame.frame_type if frame.HasField("frame_type") else 0,
+        "payload_encoding": (
+            frame.payload_encoding if frame.HasField("payload_encoding") else ""
+        ),
+        "payload_type": frame.payload_type if frame.HasField("payload_type") else "",
+        "payload": _bytes_debug(frame.payload if frame.HasField("payload") else b""),
+    }
+    if raw_frame is not None:
+        info["raw_frame"] = _bytes_debug(raw_frame)
+    return info
 
 
 def _now_rfc3339() -> str:
@@ -101,9 +164,15 @@ class RealtimeClient:
         self._downstream_q: asyncio.Queue[DownstreamAudio] = asyncio.Queue(maxsize=512)
         self._closed = asyncio.Event()
         self._recv_task: Optional[asyncio.Task] = None
+        self._rx_diag_task: Optional[asyncio.Task] = None
         # Diagnostics
         self._tx_audio_count = 0
         self._rx_audio_count = 0
+        self._last_rx_audio_at: float = 0.0
+        self._last_rx_pts_ms: int = 0
+        self._last_rx_duration_ms: int = 0
+        self._last_rx_peak: int = 0
+        self._last_rx_rms: int = 0
         self._connect_time: float = 0.0
         self._session_created_time: float = 0.0
         # Rate-limit repetitive server errors (e.g. stale-publish 1001 flood).
@@ -131,6 +200,10 @@ class RealtimeClient:
         )
         log.info("WS connected (t+%.3fs)", time.monotonic() - self._connect_time)
         self._recv_task = asyncio.create_task(self._recv_loop(), name="realtime-recv")
+        self._rx_diag_task = asyncio.create_task(
+            self._rx_audio_diagnostics_loop(),
+            name="realtime-rx-audio-diagnostics",
+        )
         await self._send_session_create()
 
     async def wait_session_created(self, timeout: float = 10.0) -> None:
@@ -214,6 +287,8 @@ class RealtimeClient:
             pass
         if self._recv_task:
             self._recv_task.cancel()
+        if self._rx_diag_task:
+            self._rx_diag_task.cancel()
 
     async def _close_due_to_recoverable_error(self, kind: str) -> None:
         if self._fatal_close_started:
@@ -233,6 +308,33 @@ class RealtimeClient:
             except asyncio.TimeoutError:
                 continue
             yield item
+
+    async def _rx_audio_diagnostics_loop(self) -> None:
+        try:
+            while not self._closed.is_set():
+                await asyncio.sleep(RX_AUDIO_DIAG_INTERVAL_S)
+                if not self._session_created_time:
+                    continue
+                age = (
+                    time.monotonic() - self._last_rx_audio_at
+                    if self._last_rx_audio_at
+                    else -1.0
+                )
+                log.info(
+                    "Realtime downstream diag session_id=%s rx_audio=%d "
+                    "last_rx_age=%.1fs last_pts_ms=%d last_duration_ms=%d "
+                    "last_peak=%d last_rms=%d tx_audio=%d",
+                    self._session_id,
+                    self._rx_audio_count,
+                    age,
+                    self._last_rx_pts_ms,
+                    self._last_rx_duration_ms,
+                    self._last_rx_peak,
+                    self._last_rx_rms,
+                    self._tx_audio_count,
+                )
+        except asyncio.CancelledError:
+            raise
 
     async def _recv_loop(self) -> None:
         assert self._ws is not None
@@ -284,7 +386,7 @@ class RealtimeClient:
             log.warning("Bad ServerEvent payload: %s (first 32 bytes hex=%s)",
                         e, frame.payload[:32].hex())
             return
-        self._dispatch(ev, frame)
+        self._dispatch(ev, frame, raw_frame=data)
 
     async def _send_ack(self, src: "fr.Frame") -> None:
         """Reply to a NeedAck frame with an IsAck frame."""
@@ -306,30 +408,61 @@ class RealtimeClient:
         except Exception as e:  # noqa: BLE001
             log.warning("Failed to send IsAck: %s", e)
 
-    def _dispatch(self, ev: mr.ServerEvent, frame: "fr.Frame | None" = None) -> None:
+    def _dispatch(
+        self,
+        ev: mr.ServerEvent,
+        frame: "fr.Frame | None" = None,
+        *,
+        raw_frame: bytes | None = None,
+    ) -> None:
         t = ev.type
         if t == "session.created":
             self._session_id = ev.session_id
             self._session_created_time = time.monotonic()
+            media = ev.session_created.session.media
+            up = media.audio_upstream_format
+            down = media.audio_downstream_format
             elapsed_since_connect = (
                 self._session_created_time - self._connect_time
             ) if self._connect_time else 0.0
             self._created_event.set()
             log.info(
                 "session.created session_id=%s client_event_id=%s "
-                "(t+%.3fs after connect)",
+                "(t+%.3fs after connect) upstream=%s/%s/%sHz downstream=%s/%s/%sHz",
                 self._session_id, ev.session_created.client_event_id,
                 elapsed_since_connect,
+                up.type,
+                up.encoding,
+                up.sample_rate,
+                down.type,
+                down.encoding,
+                down.sample_rate,
             )
         elif t == "audio.downstream.delta":
             d = ev.audio_downstream_delta
             self._rx_audio_count += 1
+            self._last_rx_audio_at = time.monotonic()
+            self._last_rx_pts_ms = int(d.pts_ms)
+            self._last_rx_duration_ms = int(d.duration_ms)
+            self._last_rx_peak, self._last_rx_rms = _pcm16_metrics(d.delta)
             # Only log the first frame per session to confirm downstream works.
-            if self._rx_audio_count == 1:
-                log.info("First downstream audio frame received: track=%s source=%s "
-                         "format=%s/%s/%sHz",
-                         d.track_id, d.source,
-                         d.format.type, d.format.encoding, d.format.sample_rate)
+            if self._rx_audio_count == 1 or self._rx_audio_count % 100 == 0:
+                log.info(
+                    "Realtime downstream frame count=%d track=%s source=%s "
+                    "format=%s/%s/%sHz pts_ms=%d duration_ms=%d bytes=%d "
+                    "peak=%d rms=%d",
+                    self._rx_audio_count,
+                    d.track_id,
+                    d.source,
+                    d.format.type,
+                    d.format.encoding,
+                    d.format.sample_rate,
+                    self._last_rx_pts_ms,
+                    self._last_rx_duration_ms,
+                    len(d.delta),
+                    self._last_rx_peak,
+                    self._last_rx_rms,
+                )
             try:
                 self._downstream_q.put_nowait(DownstreamAudio(
                     track_id=d.track_id,
@@ -427,8 +560,16 @@ class RealtimeClient:
                     self._close_due_to_recoverable_error("stream_agent_cooldown")
                 )
         else:
+            payload_case = ev.WhichOneof("payload")
+            server_event_raw = ev.SerializeToString()
             log.warning(
-                "Unhandled ServerEvent type=%r event_id=%s session_id=%s "
-                "(this is unusual — log so we can extend the dispatcher)",
-                t, ev.event_id, ev.session_id,
+                "Unhandled ServerEvent raw dump type=%r event_id=%s session_id=%s "
+                "payload_case=%s event=%s server_event_raw=%s frame=%s",
+                t,
+                ev.event_id,
+                ev.session_id,
+                payload_case,
+                _proto_dict(ev),
+                _bytes_debug(server_event_raw),
+                _frame_debug_info(frame, raw_frame=raw_frame),
             )

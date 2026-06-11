@@ -188,6 +188,7 @@ class Orchestrator:
         self._turn_started_at: float = 0.0
         self._latest_partial_started_at: float = 0.0
         self._current_reply_turn_started_at: float = 0.0
+        self._sender_started: bool = False
 
     @property
     def exit_reason(self) -> str | None:
@@ -197,25 +198,37 @@ class Orchestrator:
     def memory(self) -> MeetingMemory:
         return self._memory
 
-    async def run(self) -> None:
-        if self._meeting_id:
+    async def _start_meeting_event_consumers(self) -> None:
+        if not self._meeting_id:
+            return
+        try:
             self._event_consumers = CurrentMeetingEventConsumers(
                 self._meeting_id,
                 self._on_meeting_event,
             )
             await self._event_consumers.start()
             log.info("Meeting event consumers started meeting_id=%s", self._meeting_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Meeting event consumers disabled after startup error: %s", exc)
+
+    async def start_realtime_audio(self) -> None:
         # Start the paced sender FIRST so we begin streaming silence frames
         # upstream within ~100ms of session.created. The Feishu Realtime
-        # server closes the session (reason=0) after ~1s of no upstream audio,
-        # and ASR start() does a network handshake that can take several
-        # hundred ms.
+        # server is sensitive to delayed upstream audio at session startup.
+        if self._sender_started:
+            return
         try:
             await self._sender.start()
+            self._sender_started = True
             log.info("PacedSender started")
         except Exception:
             log.exception("Failed to start PacedSender — aborting")
             raise
+
+    async def run(self) -> None:
+        await self.start_realtime_audio()
 
         self._asr = create_asr_backend(
             on_partial=self._on_partial,
@@ -231,6 +244,12 @@ class Orchestrator:
 
         # Spawn the downstream pump (Feishu -> ASR).
         pump_task = asyncio.create_task(self._downstream_pump(), name="downstream-pump")
+        event_consumers_task: asyncio.Task | None = None
+        if self._meeting_id:
+            event_consumers_task = asyncio.create_task(
+                self._start_meeting_event_consumers(),
+                name="meeting-event-consumers-start",
+            )
 
         try:
             while not self._rt._closed.is_set():  # type: ignore[attr-defined]
@@ -241,6 +260,12 @@ class Orchestrator:
         finally:
             pump_task.cancel()
             self._cancel_soft_final_task()
+            if event_consumers_task is not None and not event_consumers_task.done():
+                event_consumers_task.cancel()
+                try:
+                    await event_consumers_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             if self._event_consumers is not None:
                 await self._event_consumers.stop()
             for task in self._artifact_tasks.values():

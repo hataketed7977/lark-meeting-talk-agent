@@ -48,17 +48,6 @@ def test_handle_result_treats_explicit_final_without_utterances_as_final():
     assert seen == ["hey james are you there"]
 
 
-def test_build_asr_start_request_includes_language_for_v2(monkeypatch):
-    monkeypatch.setattr(CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v2/asr")
-    monkeypatch.setattr(CFG.asr, "language", "en-US")
-
-    request = _build_asr_start_request("req-1")
-
-    assert request["audio"]["language"] == "en-US"
-    assert request["request"]["reqid"] == "req-1"
-    assert "language" not in request["request"]
-
-
 def test_build_asr_start_request_omits_language_for_v3_async(monkeypatch):
     monkeypatch.setattr(
         CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"

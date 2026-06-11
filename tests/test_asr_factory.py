@@ -1,11 +1,17 @@
+import asyncio
+import time
+
 from lark_meeting_voice.asr.factory import create_asr_backend
-from lark_meeting_voice.asr.sdk_asr import SDKVolcASR, _build_sdk_request_payload
-from lark_meeting_voice.asr.volc_asr import VolcASR
+from lark_meeting_voice.asr.sdk_asr import (
+    ASR_KEEPALIVE_INTERVAL_S,
+    ASR_KEEPALIVE_POLL_S,
+    SDKVolcASR,
+    _build_sdk_request_payload,
+)
 from lark_meeting_voice.config import CFG
 
 
-def test_factory_uses_sdk_backend_for_v3(monkeypatch):
-    monkeypatch.setattr(CFG.asr, "backend", "sdk")
+def test_factory_uses_sdk_backend(monkeypatch):
     monkeypatch.setattr(
         CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     )
@@ -13,15 +19,6 @@ def test_factory_uses_sdk_backend_for_v3(monkeypatch):
     backend = create_asr_backend()
 
     assert isinstance(backend, SDKVolcASR)
-
-
-def test_factory_falls_back_to_legacy_for_v2(monkeypatch):
-    monkeypatch.setattr(CFG.asr, "backend", "sdk")
-    monkeypatch.setattr(CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v2/asr")
-
-    backend = create_asr_backend()
-
-    assert isinstance(backend, VolcASR)
 
 
 def test_build_sdk_request_payload_omits_language_for_v3_async(monkeypatch):
@@ -37,6 +34,8 @@ def test_build_sdk_request_payload_omits_language_for_v3_async(monkeypatch):
 
     assert "language" not in payload["audio"]
     assert payload["request"]["model_name"] == "bigmodel"
+    assert payload["request"]["enable_ddc"] is True
+    assert payload["request"]["enable_nonstream"] is False
 
 
 def test_build_sdk_request_payload_includes_language_for_v3_nostream(monkeypatch):
@@ -52,3 +51,83 @@ def test_build_sdk_request_payload_includes_language_for_v3_nostream(monkeypatch
 
     assert payload["audio"]["language"] == "en-US"
     assert "language" not in payload["request"]
+
+
+class _FakeWebSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    async def send(self, frame: bytes) -> None:
+        self.sent.append(frame)
+
+
+def test_sdk_buffers_downstream_audio_to_configured_chunk(monkeypatch):
+    async def run() -> None:
+        monkeypatch.setattr(CFG.asr, "sample_rate", 16000)
+        monkeypatch.setattr(CFG.asr, "feed_chunk_ms", 200)
+        monkeypatch.setattr(
+            "lark_meeting_voice.asr.sdk_asr.VolcengineAsrFunctionsV3.generate_asr_audio_only_request",
+            lambda **kwargs: kwargs["audio"],
+        )
+        asr = SDKVolcASR()
+        ws = _FakeWebSocket()
+        asr._ws = ws  # noqa: SLF001
+        asr._closed = asyncio.Event()  # noqa: SLF001
+
+        await asr.feed_pcm(b"a" * 3200)
+        assert ws.sent == []
+
+        await asr.feed_pcm(b"b" * 3200)
+        assert ws.sent == [b"a" * 3200 + b"b" * 3200]
+
+    asyncio.run(run())
+
+
+def test_sdk_silence_keepalive_sends_when_downstream_pauses(monkeypatch):
+    async def run() -> None:
+        monkeypatch.setattr(CFG.asr, "sample_rate", 16000)
+        asr = SDKVolcASR()
+        ws = _FakeWebSocket()
+        asr._ws = ws  # noqa: SLF001
+        asr._closed = asyncio.Event()  # noqa: SLF001
+        asr._next_sequence = 1  # noqa: SLF001
+        asr._last_audio_sent_at = time.monotonic() - ASR_KEEPALIVE_INTERVAL_S - 0.1  # noqa: SLF001
+        asr._silence_frame = b"\x00" * 3200  # noqa: SLF001
+
+        task = asyncio.create_task(asr._silence_keepalive_loop())  # noqa: SLF001
+        await asyncio.sleep(ASR_KEEPALIVE_POLL_S + 0.1)
+        asr._closed.set()  # noqa: SLF001
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert ws.sent
+
+    asyncio.run(run())
+
+
+def test_sdk_silence_keepalive_does_not_flood_recent_audio(monkeypatch):
+    async def run() -> None:
+        monkeypatch.setattr(CFG.asr, "sample_rate", 16000)
+        asr = SDKVolcASR()
+        ws = _FakeWebSocket()
+        asr._ws = ws  # noqa: SLF001
+        asr._closed = asyncio.Event()  # noqa: SLF001
+        asr._next_sequence = 1  # noqa: SLF001
+        asr._last_audio_sent_at = time.monotonic()  # noqa: SLF001
+        asr._silence_frame = b"\x00" * 3200  # noqa: SLF001
+
+        task = asyncio.create_task(asr._silence_keepalive_loop())  # noqa: SLF001
+        await asyncio.sleep(ASR_KEEPALIVE_POLL_S + 0.1)
+        asr._closed.set()  # noqa: SLF001
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+        assert ws.sent == []
+
+    asyncio.run(run())

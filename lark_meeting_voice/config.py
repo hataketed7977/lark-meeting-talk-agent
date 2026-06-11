@@ -34,7 +34,6 @@ class FeishuConfig:
 
 @dataclass
 class ASRConfig:
-    backend: str = os.getenv("VOLC_ASR_BACKEND", "sdk")
     appid: str = os.getenv("VOLC_ASR_APPID", "")
     token: str = os.getenv("VOLC_ASR_TOKEN", "")
     cluster: str = os.getenv("VOLC_ASR_CLUSTER", "volcengine_streaming_common")
@@ -44,6 +43,7 @@ class ASRConfig:
     )
     language: str = os.getenv("VOLC_ASR_LANGUAGE", "en-US")
     sample_rate: int = 16000
+    feed_chunk_ms: int = int(os.getenv("VOLC_ASR_FEED_CHUNK_MS", "200"))
     connect_timeout_s: float = float(os.getenv("VOLC_ASR_CONNECT_TIMEOUT_S", "10"))
     stream_idle_timeout_s: float = float(
         os.getenv("VOLC_ASR_STREAM_IDLE_TIMEOUT_S", "20")

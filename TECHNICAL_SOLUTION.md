@@ -284,13 +284,12 @@ Compared with a transcript-only memory design, this path provides:
 
 ### 6.3 Volcengine ASR
 
-The codebase supports more than one ASR path, but the preferred stable runtime today is:
+The runtime uses one ASR path, aligned with the official large-model streaming ASR V3 docs:
 
-- `VOLC_ASR_BACKEND=legacy`
-- `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr`
+- `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`
 - `VOLC_ASR_LANGUAGE=en-US`
 
-This is an engineering choice made for live stability in English-first meetings, not because newer paths are conceptually worse.
+Do not add multiple ASR runtime protocols unless there is an explicit product decision to support them.
 
 ### 6.4 OpenAI-Compatible LLM
 
@@ -469,8 +468,7 @@ Solution:
 The current recommended stable local runtime profile is:
 
 ```env
-VOLC_ASR_BACKEND=legacy
-VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr
+VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 VOLC_ASR_LANGUAGE=en-US
 LLM_MODEL=doubao-seed-2-0-mini-260428
 VOLC_TTS_VOICE_TYPE=zh_male_m191_uranus_bigtts

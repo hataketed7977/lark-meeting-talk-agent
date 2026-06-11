@@ -136,9 +136,6 @@ async def _run(
             )
             rt = RealtimeClient(resolved_ws_url)
             await rt.connect()
-            await rt.wait_session_created()
-            logging.info("Realtime session ready; entering orchestrator loop")
-
             reuse_memory = (
                 retained_memory
                 if retained_memory is not None
@@ -150,6 +147,10 @@ async def _run(
             if "memory" in inspect.signature(Orchestrator).parameters:
                 orch_kwargs["memory"] = reuse_memory
             orch = Orchestrator(rt, **orch_kwargs)
+            await rt.wait_session_created()
+            logging.info("Realtime session ready; starting audio upstream")
+            await orch.start_realtime_audio()
+            logging.info("Realtime audio upstream ready; entering orchestrator loop")
             orch_task = asyncio.create_task(orch.run(), name=f"orchestrator-{attempt}")
             stop_task = asyncio.create_task(
                 stop_evt.wait(), name=f"stop-wait-{attempt}"

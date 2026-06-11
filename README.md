@@ -17,7 +17,7 @@ It is built on Feishu/Lark VC realtime audio, Volcengine streaming ASR, an OpenA
 
 ## Streaming Providers
 
-- ASR supports both the official SDK path and a legacy handcrafted WebSocket path. The default runtime now aligns with the official ASR 2.0 WebSocket docs: `VOLC_ASR_BACKEND=sdk`, `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`, and a provisioned `VOLC_ASR_RESOURCE_ID`.
+- ASR uses the official large-model streaming V3 WebSocket path: `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async` and a provisioned `VOLC_ASR_RESOURCE_ID`.
 - LLM replies use OpenAI-compatible streaming chat completions (`stream=True`) and are chunked into TTS as tokens arrive.
 - TTS uses Volcengine HTTP V3 unidirectional streaming by default with `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`. The currently preferred bilingual demo voice is `zh_male_m191_uranus_bigtts`.
 
@@ -65,7 +65,7 @@ cp .env.example .env
 Fill in `.env` with:
 
 - Feishu/Lark app credentials and a user access token or refresh token.
-- Volcengine ASR credentials. The default path follows the official ASR 2.0 docs: `VOLC_ASR_BACKEND=sdk`, `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`, `VOLC_ASR_RESOURCE_ID=<your v3 resource_id>`, and `VOLC_ASR_LANGUAGE=en-US`. The older `legacy` / `v2` path remains available only as a compatibility fallback.
+- Volcengine ASR credentials. The runtime follows the official large-model streaming ASR V3 docs: `VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async`, `VOLC_ASR_RESOURCE_ID=<your v3 resource_id>`, and `VOLC_ASR_LANGUAGE=en-US`.
 - OpenAI-compatible LLM endpoint, key, and model name via `LLM_*` variables. The current low-latency demo choice is `doubao-seed-2-0-mini-260428`.
 - Volcengine TTS credentials. The preferred runtime uses TTS 2.0 HTTP V3 with `VOLC_TTS_API_VERSION=2.0`, `VOLC_TTS_HTTP_URL=https://openspeech.bytedance.com/api/v3/tts/unidirectional`, `VOLC_TTS_RESOURCE_ID=seed-tts-2.0`, and `VOLC_TTS_VOICE_TYPE=zh_male_m191_uranus_bigtts`. Set `VOLC_TTS_API_VERSION=1.0` to use the legacy WebSocket TTS path.
 - Agent tuning values such as `ENGAGED_IDLE_TIMEOUT_S=0`, `LLM_TTS_CHUNK_MIN_CHARS=12`, and `LLM_TTS_CHUNK_MAX_CHARS=100` are part of the current stable spoken demo profile.
@@ -75,7 +75,6 @@ VC bot join and realtime endpoint APIs require a Feishu/Lark `user_access_token`
 Recommended stable live-demo profile:
 
 ```env
-VOLC_ASR_BACKEND=sdk
 VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 VOLC_ASR_LANGUAGE=en-US
 LLM_MODEL=doubao-seed-2-0-mini-260428

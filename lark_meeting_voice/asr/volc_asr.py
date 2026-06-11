@@ -487,7 +487,7 @@ class VolcASR:
 
     async def _handle_result(self, parsed: dict) -> None:
         payload = parsed.get("payload", {})
-        # Result shape is v2/v3 dependent. v3 can return partial text without
+        # Newer ASR responses can return partial text without
         # `utterances[].definite`, so we need a broader final-turn detector.
         results = payload.get("result") or []
         if not results:

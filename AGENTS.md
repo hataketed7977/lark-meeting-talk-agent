@@ -25,15 +25,14 @@ When tradeoffs appear, optimize in this order:
 4. Natural bilingual TTS
 5. Architecture cleanliness
 
-Do not switch the runtime to a newer ASR path just because README defaults mention it. This project has already been tuned toward a more stable local runtime.
+Use the single ASR runtime configured in `.env`; do not introduce multiple ASR runtime protocols without explicit user approval.
 
 ## Current Stable Local Runtime
 
 Use the local `.env` as the runtime source of truth. At the time this file was written, the preferred local settings are:
 
 ```env
-VOLC_ASR_BACKEND=legacy
-VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v2/asr
+VOLC_ASR_WS_URL=wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async
 VOLC_ASR_LANGUAGE=en-US
 LLM_MODEL=doubao-seed-2-0-mini-260428
 VOLC_TTS_VOICE_TYPE=zh_male_m191_uranus_bigtts
@@ -45,7 +44,7 @@ LLM_TTS_CHUNK_MAX_CHARS=100
 Notes:
 
 - `ENGAGED_IDLE_TIMEOUT_S` must stay single-defined. Duplicate keys in `.env` caused a real bug before, where a later `60` overrode the intended `0`.
-- README may describe older defaults such as SDK ASR or another TTS voice. For live operation, prefer the actual local `.env`.
+- ASR should stay on the official large-model streaming V3 path unless the user explicitly asks for a migration.
 - Keep `.env` local. Do not commit secrets or local demo-only tuning unless explicitly asked.
 
 ## Standard Operations

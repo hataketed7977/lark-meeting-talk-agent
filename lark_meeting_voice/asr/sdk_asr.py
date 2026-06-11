@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from typing import Any, Optional
 
 import websockets
+from pydantic import ValidationError
 from volcengine_audio.stt import (
     ListenBidirectionPackage,
     VolcengineAsrFunctionsV3,
@@ -21,6 +23,9 @@ from lark_meeting_voice.asr.volc_asr import (
 from lark_meeting_voice.config import CFG
 
 log = logging.getLogger(__name__)
+
+ASR_KEEPALIVE_INTERVAL_S = 6.0
+ASR_KEEPALIVE_POLL_S = 1.0
 
 
 def _build_sdk_request_payload() -> dict[str, Any]:
@@ -38,7 +43,9 @@ def _build_sdk_request_payload() -> dict[str, Any]:
         "audio": audio,
         "request": {
             "model_name": "bigmodel",
+            "enable_ddc": True,
             "enable_itn": True,
+            "enable_nonstream": False,
             "enable_punc": True,
             "show_utterances": True,
             "result_type": "single",
@@ -62,6 +69,7 @@ class SDKVolcASR:
         self._on_error = on_error
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._recv_task: Optional[asyncio.Task] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
         self._closed = asyncio.Event()
         self._send_lock = asyncio.Lock()
         self._last_partial = ""
@@ -72,11 +80,19 @@ class SDKVolcASR:
         self._stop_lock = asyncio.Lock()
         self._stop_started = False
         self._final_frame_sent = False
+        self._last_audio_sent_at = 0.0
+        self._feed_chunk_bytes = max(
+            2,
+            int(CFG.asr.sample_rate * CFG.asr.feed_chunk_ms / 1000 * 2),
+        )
+        self._audio_buffer = bytearray()
+        self._silence_frame = b"\x00" * self._feed_chunk_bytes
+        self._logged_ignored_payload_shape = False
 
     async def start(self) -> None:
         if "/api/v3/" not in CFG.asr.ws_url:
             raise RuntimeError(
-                "SDKVolcASR requires a v3 ASR endpoint; use legacy backend for v2"
+                "SDKVolcASR requires the official ASR V3 endpoint"
             )
         req_id = str(uuid.uuid4())
         self._request_id = req_id
@@ -84,6 +100,8 @@ class SDKVolcASR:
         self._next_sequence = 1
         self._stop_started = False
         self._final_frame_sent = False
+        self._audio_buffer.clear()
+        self._last_audio_sent_at = time.monotonic()
         headers = {
             "X-Api-App-Key": CFG.asr.appid,
             "X-Api-Access-Key": CFG.asr.token,
@@ -115,6 +133,10 @@ class SDKVolcASR:
                 self._ws.send(frame), timeout=CFG.asr.connect_timeout_s
             )
         self._recv_task = asyncio.create_task(self._recv_loop(), name="asr-sdk-recv")
+        self._keepalive_task = asyncio.create_task(
+            self._silence_keepalive_loop(),
+            name="asr-sdk-silence-keepalive",
+        )
         log.info(
             "Volc ASR SDK backend started req_id=%s endpoint=%s resource_id=%s language=%s logid=%s connect_id=%s",
             req_id,
@@ -131,6 +153,13 @@ class SDKVolcASR:
         self._feed_count += 1
         if self._feed_count == 1 or self._feed_count % 100 == 0:
             log.info("ASR feed chunk count=%d pcm_bytes=%d", self._feed_count, len(pcm16k))
+        self._audio_buffer.extend(pcm16k)
+        while len(self._audio_buffer) >= self._feed_chunk_bytes:
+            chunk = bytes(self._audio_buffer[: self._feed_chunk_bytes])
+            del self._audio_buffer[: self._feed_chunk_bytes]
+            await self._send_audio_frame(chunk, source="downstream")
+
+    async def _send_audio_frame(self, pcm16k: bytes, *, source: str) -> None:
         async with self._send_lock:
             if self._closed.is_set() or self._ws is None:
                 return
@@ -147,21 +176,42 @@ class SDKVolcASR:
                 await asyncio.wait_for(
                     self._ws.send(frame), timeout=CFG.asr.stream_idle_timeout_s
                 )
+                self._last_audio_sent_at = time.monotonic()
             except asyncio.TimeoutError:
                 self._closed.set()
-                log.warning("ASR SDK send timed out req_id=%s", self._request_id)
+                log.warning(
+                    "ASR SDK send timed out req_id=%s source=%s",
+                    self._request_id,
+                    source,
+                )
                 if self._on_error:
                     await self._on_error("asr_send_failed")
             except websockets.ConnectionClosed as exc:
                 self._closed.set()
                 log.warning(
-                    "ASR SDK send failed on closed socket req_id=%s code=%s reason=%s",
+                    "ASR SDK send failed on closed socket req_id=%s source=%s code=%s reason=%s",
                     self._request_id,
+                    source,
                     getattr(exc, "code", None),
                     getattr(exc, "reason", ""),
                 )
                 if self._on_error:
                     await self._on_error("asr_send_failed")
+
+    async def _silence_keepalive_loop(self) -> None:
+        try:
+            while not self._closed.is_set():
+                await asyncio.sleep(ASR_KEEPALIVE_POLL_S)
+                if time.monotonic() - self._last_audio_sent_at < ASR_KEEPALIVE_INTERVAL_S:
+                    continue
+                await self._send_audio_frame(self._silence_frame, source="silence")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.exception("ASR SDK silence keepalive crashed: %s", exc)
+            self._closed.set()
+            if self._on_error:
+                await self._on_error("asr_send_failed")
 
     async def stop(self) -> None:
         async with self._stop_lock:
@@ -175,6 +225,18 @@ class SDKVolcASR:
         if ws is not None:
             try:
                 async with self._send_lock:
+                    if self._audio_buffer:
+                        frame = bytes(
+                            VolcengineAsrFunctionsV3.generate_asr_audio_only_request(
+                                sequence=self._next_sequence,
+                                audio=bytes(self._audio_buffer),
+                                compress=True,
+                                keep_sequence=True,
+                            )
+                        )
+                        await ws.send(frame)
+                        self._next_sequence += 1
+                        self._audio_buffer.clear()
                     if not self._final_frame_sent:
                         frame = bytes(
                             VolcengineAsrFunctionsV3.generate_asr_audio_only_request(
@@ -202,6 +264,12 @@ class SDKVolcASR:
             self._recv_task.cancel()
             try:
                 await self._recv_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
             except (asyncio.CancelledError, Exception):
                 pass
 
@@ -250,11 +318,14 @@ class SDKVolcASR:
     ) -> ListenBidirectionPackage | None:
         message = parsed.get("message")
         if not isinstance(message, dict):
+            self._log_ignored_payload("message_not_dict", parsed, None)
             return None
         result = message.get("result")
         if not isinstance(result, dict):
+            self._log_ignored_payload("result_not_dict", parsed, message)
             return None
         if not (result.get("text") or result.get("utterances")):
+            self._log_ignored_payload("empty_result", parsed, message)
             return None
         try:
             return ListenBidirectionPackage.model_validate(
@@ -272,6 +343,22 @@ class SDKVolcASR:
                 sorted(message.keys()),
             )
             return None
+
+    def _log_ignored_payload(
+        self,
+        reason: str,
+        parsed: dict[str, Any],
+        message: dict[str, Any] | None,
+    ) -> None:
+        if self._logged_ignored_payload_shape:
+            return
+        self._logged_ignored_payload_shape = True
+        log.info(
+            "ASR SDK ignored payload reason=%s parsed_keys=%s message=%s",
+            reason,
+            sorted(parsed.keys()),
+            message if message is not None else parsed.get("message"),
+        )
 
     async def _dispatch_package(self, package: ListenBidirectionPackage) -> None:
         result = package.message.result
