@@ -1,14 +1,17 @@
-"""Volcengine streaming TTS (BigTTS / bigmodel).
+"""Volcengine streaming TTS.
 
-Supports the legacy WebSocket binary protocol and the TTS 2.0 HTTP V3
-unidirectional streaming API. We request `audio/pcm` at 24 kHz s16le mono so
-the output matches Feishu's upstream format byte-for-byte (no resampling
-needed).
+Supports three runtime modes:
+
+- `ws_v3`: official WebSocket bidirectional streaming V3 path
+- `http_v3`: TTS 2.0 HTTP V3 unidirectional streaming fallback
+- `legacy_ws_v1`: older WebSocket binary protocol fallback
 
 Public API:
 
     tts = VolcTTS()
     async for pcm_chunk in tts.synthesize(text, cancel_event):
+        ...
+    async for pcm_chunk in tts.synthesize_stream(token_stream, cancel_event):
         ...
 """
 
@@ -22,7 +25,7 @@ import logging
 import struct
 import uuid
 from json import JSONDecodeError
-from typing import AsyncIterator, Dict, Iterator, List, Tuple
+from typing import Any, AsyncIterator, Dict, Iterator, List, Tuple
 
 import aiohttp
 import websockets
@@ -31,10 +34,12 @@ from lark_meeting_voice.config import CFG
 
 log = logging.getLogger(__name__)
 
-# Header is identical layout to ASR.
+# Binary frame constants shared by v1/v3 websocket protocols.
 PROTOCOL_VERSION = 0b0001
 DEFAULT_HEADER_SIZE = 0b0001
+SERIALIZATION_RAW = 0b0000
 SERIALIZATION_JSON = 0b0001
+COMPRESSION_NONE = 0b0000
 COMPRESSION_GZIP = 0b0001
 
 FULL_CLIENT_REQUEST = 0b0001
@@ -42,17 +47,121 @@ AUDIO_ONLY_RESPONSE = 0b1011
 FULL_SERVER_RESPONSE = 0b1001
 SERVER_ERROR = 0b1111
 
+# Official V3 control events.
+START_CONNECTION_EVENT = 1
+FINISH_CONNECTION_EVENT = 2
+CONNECTION_STARTED_EVENT = 50
+START_SESSION_EVENT = 100
+FINISH_SESSION_EVENT = 102
+SESSION_STARTED_EVENT = 150
+SESSION_FINISHED_EVENT = 152
+TASK_REQUEST_EVENT = 200
 
-def _header(message_type: int) -> bytes:
+# V3 request/response frames include an event number in the optional header.
+WITH_EVENT = 0b0100
+
+
+def _extract_response_headers(ws: Any) -> dict[str, str]:
+    headers = getattr(ws, "response_headers", None)
+    if headers is None:
+        response = getattr(ws, "response", None)
+        headers = getattr(response, "headers", None)
+    if headers is None:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in headers.items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _iter_once(text: str) -> AsyncIterator[str]:
+    async def _gen() -> AsyncIterator[str]:
+        yield text
+
+    return _gen()
+
+
+def _build_additions() -> str | None:
+    additions: dict[str, object] = {}
+    if not additions:
+        return None
+    return json.dumps(additions, ensure_ascii=False)
+
+
+def _build_ws_v3_headers(connect_id: str) -> dict[str, str]:
+    headers = {
+        "X-Api-Resource-Id": CFG.tts.resource_id,
+        "X-Api-Connect-Id": connect_id,
+        "X-Control-Require-Usage-Tokens-Return": "*",
+    }
+    if CFG.tts.api_key:
+        headers["X-Api-Key"] = CFG.tts.api_key
+    else:
+        headers["X-Api-App-Key"] = CFG.tts.appid
+        headers["X-Api-Access-Key"] = CFG.tts.token
+    return headers
+
+
+def _build_v3_audio_params() -> dict[str, object]:
+    params: dict[str, object] = {
+        "format": "pcm",
+        "sample_rate": CFG.tts.sample_rate,
+        "speech_rate": 0,
+        "loudness_rate": 0,
+    }
+    return params
+
+
+def _build_v3_session_payload(text: str = "") -> dict[str, object]:
+    req_params: dict[str, object] = {
+        "text": text,
+        "speaker": CFG.tts.voice_type,
+        "audio_params": _build_v3_audio_params(),
+    }
+    additions = _build_additions()
+    if additions is not None:
+        req_params["additions"] = additions
+    return {
+        "user": {"uid": "lark_meeting_voice"},
+        "event": START_SESSION_EVENT,
+        "namespace": "BidirectionalTTS",
+        "req_params": req_params,
+    }
+
+
+def _build_v3_task_payload(text: str) -> dict[str, object]:
+    return {
+        "user": {"uid": "lark_meeting_voice"},
+        "event": TASK_REQUEST_EVENT,
+        "namespace": "BidirectionalTTS",
+        "req_params": {"text": text},
+    }
+
+
+def _build_v3_control_payload(event: int) -> dict[str, object]:
+    return {
+        "user": {"uid": "lark_meeting_voice"},
+        "event": event,
+        "namespace": "BidirectionalTTS",
+    }
+
+
+def _header(
+    message_type: int,
+    *,
+    flags: int = 0,
+    serialization: int = SERIALIZATION_JSON,
+    compression: int = COMPRESSION_GZIP,
+) -> bytes:
     b0 = (PROTOCOL_VERSION << 4) | DEFAULT_HEADER_SIZE
-    b1 = (message_type << 4) | 0
-    b2 = (SERIALIZATION_JSON << 4) | COMPRESSION_GZIP
+    b1 = (message_type << 4) | flags
+    b2 = (serialization << 4) | compression
     return bytes([b0, b1, b2, 0])
 
 
 class VolcTTS:
     def __init__(self) -> None:
-        pass
+        self._send_lock = asyncio.Lock()
 
     async def synthesize(
         self,
@@ -61,13 +170,196 @@ class VolcTTS:
     ) -> AsyncIterator[bytes]:
         if not text.strip() or cancel_event.is_set():
             return
-        if CFG.tts.api_version.startswith("2"):
+        if CFG.tts.mode == "ws_v3":
+            async for chunk in self._synthesize_ws_v3(_iter_once(text), cancel_event):
+                yield chunk
+            return
+        if CFG.tts.mode == "http_v3" or CFG.tts.api_version.startswith("2"):
             async for chunk in self._synthesize_http_v3(text, cancel_event):
                 yield chunk
             return
 
         async for chunk in self._synthesize_ws_v1(text, cancel_event):
             yield chunk
+
+    async def synthesize_stream(
+        self,
+        text_stream: AsyncIterator[str],
+        cancel_event: asyncio.Event,
+    ) -> AsyncIterator[bytes]:
+        if CFG.tts.mode == "ws_v3":
+            async for chunk in self._synthesize_ws_v3(text_stream, cancel_event):
+                yield chunk
+            return
+
+        from lark_meeting_voice.llm.openai_compatible import sentence_chunks
+
+        async for sentence in sentence_chunks(
+            text_stream,
+            cancel_event,
+            min_chars=CFG.llm.tts_chunk_min_chars,
+            max_chars=CFG.llm.tts_chunk_max_chars,
+        ):
+            async for chunk in self.synthesize(sentence, cancel_event):
+                yield chunk
+
+    async def _send_ws_v3_event(
+        self,
+        ws: Any,
+        event: int,
+        payload: dict[str, object],
+    ) -> None:
+        body = gzip.compress(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        frame = (
+            _header(FULL_CLIENT_REQUEST, flags=WITH_EVENT)
+            + struct.pack(">I", event)
+            + struct.pack(">I", len(body))
+            + body
+        )
+        async with self._send_lock:
+            await asyncio.wait_for(ws.send(frame), timeout=CFG.tts.connect_timeout_s)
+
+    async def _await_ws_v3_event(
+        self,
+        ws: Any,
+        expected_event: int,
+        cancel_event: asyncio.Event,
+    ) -> None:
+        while True:
+            if cancel_event.is_set():
+                raise asyncio.CancelledError()
+            try:
+                msg = await asyncio.wait_for(
+                    ws.recv(), timeout=CFG.tts.stream_idle_timeout_s
+                )
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"TTS WS V3 timed out waiting for event={expected_event}"
+                ) from exc
+            parsed = _parse_ws_v3_message(msg)
+            if parsed["kind"] == "error":
+                raise RuntimeError(
+                    f"TTS WS V3 error code={parsed.get('code')} payload={parsed.get('payload')}"
+                )
+            if parsed["kind"] == "control" and parsed.get("event") == expected_event:
+                return
+
+    async def _send_ws_v3_text(
+        self,
+        ws: Any,
+        text_stream: AsyncIterator[str],
+        cancel_event: asyncio.Event,
+    ) -> None:
+        async for text in text_stream:
+            if cancel_event.is_set():
+                break
+            if not text:
+                continue
+            await self._send_ws_v3_event(
+                ws,
+                TASK_REQUEST_EVENT,
+                _build_v3_task_payload(text),
+            )
+        await self._send_ws_v3_event(
+            ws,
+            FINISH_SESSION_EVENT,
+            _build_v3_control_payload(FINISH_SESSION_EVENT),
+        )
+
+    async def _synthesize_ws_v3(
+        self,
+        text_stream: AsyncIterator[str],
+        cancel_event: asyncio.Event,
+    ) -> AsyncIterator[bytes]:
+        connect_id = str(uuid.uuid4())
+        headers = _build_ws_v3_headers(connect_id)
+        ws = await websockets.connect(
+            CFG.tts.ws_url,
+            additional_headers=headers,
+            max_size=None,
+            ping_interval=10,
+            ping_timeout=10,
+            open_timeout=CFG.tts.connect_timeout_s,
+            close_timeout=5,
+        )
+        response_headers = _extract_response_headers(ws)
+        log.info(
+            "Volc TTS WS V3 connected connect_id=%s endpoint=%s resource_id=%s voice_type=%s logid=%s",
+            connect_id,
+            CFG.tts.ws_url,
+            CFG.tts.resource_id,
+            CFG.tts.voice_type,
+            response_headers.get("X-Tt-Logid", ""),
+        )
+        sender_task: asyncio.Task[None] | None = None
+        try:
+            await self._send_ws_v3_event(
+                ws,
+                START_CONNECTION_EVENT,
+                _build_v3_control_payload(START_CONNECTION_EVENT),
+            )
+            await self._await_ws_v3_event(ws, CONNECTION_STARTED_EVENT, cancel_event)
+            await self._send_ws_v3_event(
+                ws,
+                START_SESSION_EVENT,
+                _build_v3_session_payload(),
+            )
+            await self._await_ws_v3_event(ws, SESSION_STARTED_EVENT, cancel_event)
+            sender_task = asyncio.create_task(
+                self._send_ws_v3_text(ws, text_stream, cancel_event),
+                name="tts-ws-v3-send",
+            )
+            while True:
+                if cancel_event.is_set() and sender_task.done():
+                    break
+                try:
+                    msg = await asyncio.wait_for(
+                        ws.recv(), timeout=CFG.tts.stream_idle_timeout_s
+                    )
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "TTS WS V3 stream idle timeout after %.1fs",
+                        CFG.tts.stream_idle_timeout_s,
+                    )
+                    break
+                except websockets.ConnectionClosed:
+                    break
+                parsed = _parse_ws_v3_message(msg)
+                if parsed["kind"] == "audio":
+                    chunk = parsed.get("audio", b"")
+                    if isinstance(chunk, bytes) and chunk:
+                        yield chunk
+                    continue
+                if parsed["kind"] == "error":
+                    log.error(
+                        "TTS WS V3 error code=%s payload=%s",
+                        parsed.get("code"),
+                        parsed.get("payload"),
+                    )
+                    break
+                if (
+                    parsed["kind"] == "control"
+                    and parsed.get("event") == SESSION_FINISHED_EVENT
+                ):
+                    break
+        finally:
+            if sender_task is not None:
+                try:
+                    await sender_task
+                except Exception as e:  # noqa: BLE001
+                    log.warning("TTS WS V3 sender task failed: %s", e)
+            try:
+                await self._send_ws_v3_event(
+                    ws,
+                    FINISH_CONNECTION_EVENT,
+                    _build_v3_control_payload(FINISH_CONNECTION_EVENT),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.debug("TTS WS V3 finish connection failed: %s", e)
+            try:
+                await ws.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     async def _synthesize_http_v3(
         self,
@@ -324,3 +616,69 @@ def _decode_http_v3_audio(item: Dict[str, object]) -> Tuple[bytes, bool]:
     if not done and data in (None, "") and code in {20000000, "20000000"}:
         done = True
     return chunk, done
+
+
+def _parse_ws_v3_message(msg: object) -> dict[str, object]:
+    if isinstance(msg, str):
+        return {"kind": "text", "payload": msg}
+    if not isinstance(msg, (bytes, bytearray)):
+        return {"kind": "unknown"}
+    data = bytes(msg)
+    if len(data) < 4:
+        return {"kind": "unknown"}
+
+    header_size = data[0] & 0x0F
+    message_type = (data[1] >> 4) & 0x0F
+    flags = data[1] & 0x0F
+    serialization = (data[2] >> 4) & 0x0F
+    compression = data[2] & 0x0F
+    cursor = header_size * 4
+    event = None
+    if flags == WITH_EVENT and cursor + 4 <= len(data):
+        event = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        cursor += 4
+
+    if message_type == SERVER_ERROR:
+        if cursor + 4 > len(data):
+            return {"kind": "error", "event": event}
+        code = struct.unpack(">i", data[cursor : cursor + 4])[0]
+        cursor += 4
+        if cursor + 4 > len(data):
+            return {"kind": "error", "event": event, "code": code}
+        payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
+        cursor += 4
+        payload = data[cursor : cursor + payload_size]
+        if compression == COMPRESSION_GZIP and payload:
+            try:
+                payload = gzip.decompress(payload)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            decoded: object = json.loads(payload.decode("utf-8")) if payload else {}
+        except Exception:  # noqa: BLE001
+            decoded = payload
+        return {"kind": "error", "event": event, "code": code, "payload": decoded}
+
+    if cursor + 4 > len(data):
+        return {"kind": "unknown", "event": event}
+    payload_size = struct.unpack(">I", data[cursor : cursor + 4])[0]
+    cursor += 4
+    payload = data[cursor : cursor + payload_size]
+
+    if message_type == AUDIO_ONLY_RESPONSE:
+        return {"kind": "audio", "event": event, "audio": payload}
+
+    if compression == COMPRESSION_GZIP and payload:
+        payload = gzip.decompress(payload)
+    if serialization == SERIALIZATION_JSON and payload:
+        try:
+            decoded_payload: object = json.loads(payload.decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            decoded_payload = {"_raw": payload}
+    else:
+        decoded_payload = payload
+    return {
+        "kind": "control" if message_type == FULL_SERVER_RESPONSE else "unknown",
+        "event": event,
+        "payload": decoded_payload,
+    }

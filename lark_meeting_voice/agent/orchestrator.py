@@ -39,7 +39,6 @@ from lark_meeting_voice.lark.event_consumer import (
 from lark_meeting_voice.lark.realtime import RealtimeClient
 from lark_meeting_voice.llm.openai_compatible import (
     OpenAICompatibleLLM,
-    sentence_chunks,
 )
 from lark_meeting_voice.knowledge_routes import (
     build_doc_context,
@@ -832,19 +831,10 @@ class Orchestrator:
                 max_tokens=reply_max_tokens,
                 on_complete=self._remember_assistant_reply,
             )
-            async for sentence in sentence_chunks(
-                token_stream,
-                cancel_event,
-                min_chars=CFG.llm.tts_chunk_min_chars,
-                max_chars=CFG.llm.tts_chunk_max_chars,
-            ):
+            async for pcm in self._tts.synthesize_stream(token_stream, cancel_event):
                 if cancel_event.is_set():
                     break
-                log.debug("TTS sentence: %s", sentence)
-                async for pcm in self._tts.synthesize(sentence, cancel_event):
-                    if cancel_event.is_set():
-                        break
-                    await self._queue_pcm(pcm)
+                await self._queue_pcm(pcm)
             if not cancel_event.is_set() and not self._tts_audio_started:
                 log.warning("Reply produced no audio; speaking fallback prompt")
                 async for pcm in self._tts.synthesize(

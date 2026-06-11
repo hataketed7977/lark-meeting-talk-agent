@@ -86,12 +86,15 @@ class LLMConfig:
 
 @dataclass
 class TTSConfig:
+    api_key: str = os.getenv("VOLC_TTS_API_KEY", "")
     appid: str = os.getenv("VOLC_TTS_APPID", "")
     token: str = os.getenv("VOLC_TTS_TOKEN", "")
     cluster: str = os.getenv("VOLC_TTS_CLUSTER", "volcano_tts")
     api_version: str = os.getenv("VOLC_TTS_API_VERSION", "2.0")
+    mode: str = os.getenv("VOLC_TTS_MODE", "ws_v3")
     ws_url: str = os.getenv(
-        "VOLC_TTS_WS_URL", "wss://openspeech.bytedance.com/api/v1/tts/ws_binary"
+        "VOLC_TTS_WS_URL",
+        "wss://openspeech.bytedance.com/api/v3/tts/bidirection",
     )
     http_url: str = os.getenv(
         "VOLC_TTS_HTTP_URL",
