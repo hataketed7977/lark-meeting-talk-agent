@@ -48,6 +48,8 @@ def test_is_low_value_query_only_filters_explicit_fillers():
     assert not _is_low_value_query("yes")
     assert not _is_low_value_query("no")
     assert not _is_low_value_query("what time is it")
+    assert not _is_low_value_query("帮我总结一下")
+    assert not _is_low_value_query("James，帮我总结一下")
 
 
 def test_orchestrator_meeting_ended_sets_graceful_shutdown():

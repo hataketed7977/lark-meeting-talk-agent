@@ -89,12 +89,24 @@ Or:
 
 If a meeting bot is already running in a terminal, stop that command before starting a replacement process. Avoid multiple competing bot processes for the same meeting.
 
-Preferred operating pattern:
+Mandatory restart pattern:
 
 1. Check whether a prior bot process is still running
-2. Stop it cleanly
-3. Start a fresh process
-4. Verify logs before telling the user the bot is ready
+2. Stop the prior bot process cleanly
+3. Explicitly leave the meeting with `.venv/bin/python -u -m lark_meeting_voice.leave --meeting-no <meeting_no>` or the `meeting_id` form before rejoining
+4. Confirm there is no remaining `python -u -m lark_meeting_voice` process for the same meeting number
+5. Start exactly one fresh bot process
+6. Verify readiness logs before telling the user the bot is ready
+
+Do not skip the leave step when the user asks to "restart", "retry", or "rejoin". In this project, restart means `stop -> leave -> verify single-process-zero -> start one new join`.
+
+Recommended verification command before and after restart:
+
+```bash
+pgrep -fl "python -u -m lark_meeting_voice"
+```
+
+If more than one bot process is visible for the same meeting, treat that as an operational error and clean it up before proceeding.
 
 ## Readiness Checks
 

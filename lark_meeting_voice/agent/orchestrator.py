@@ -37,7 +37,10 @@ from lark_meeting_voice.lark.event_consumer import (
     MeetingEvent,
 )
 from lark_meeting_voice.lark.realtime import RealtimeClient
-from lark_meeting_voice.llm.openai_compatible import OpenAICompatibleLLM, sentence_chunks
+from lark_meeting_voice.llm.openai_compatible import (
+    OpenAICompatibleLLM,
+    sentence_chunks,
+)
 from lark_meeting_voice.memory.meeting_memory import MeetingMemory
 from lark_meeting_voice.tts.volc_tts import VolcTTS
 from lark_meeting_voice.wake.detector import WakeDetector
@@ -81,7 +84,12 @@ _LOW_VALUE_QUERY_WORDS = {
 
 
 def _is_low_value_query(text: str) -> bool:
-    normalized = re.sub(r"[^a-z]+", " ", (text or "").lower()).strip()
+    raw = " ".join((text or "").strip().split())
+    if not raw:
+        return True
+    if _contains_cjk(raw):
+        return False
+    normalized = re.sub(r"[^a-z]+", " ", raw.lower()).strip()
     if not normalized:
         return True
     words = normalized.split()
@@ -517,13 +525,17 @@ class Orchestrator:
             return
         except ArtifactFetchError as exc:
             self._memory.apply_artifact_error(kind, token, str(exc))
-            log.warning("Meeting artifact fetch failed kind=%s token=%s: %s", kind, token, exc)
+            log.warning(
+                "Meeting artifact fetch failed kind=%s token=%s: %s", kind, token, exc
+            )
             return
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
             self._memory.apply_artifact_error(kind, token, str(exc))
-            log.warning("Meeting artifact fetch crashed kind=%s token=%s: %s", kind, token, exc)
+            log.warning(
+                "Meeting artifact fetch crashed kind=%s token=%s: %s", kind, token, exc
+            )
             return
         finally:
             self._artifact_tasks.pop(key, None)
