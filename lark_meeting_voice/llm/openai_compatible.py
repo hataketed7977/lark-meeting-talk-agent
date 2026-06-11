@@ -107,6 +107,7 @@ class OpenAICompatibleLLM:
         user_text: str,
         cancel_event: asyncio.Event,
         meeting_context: str | None = None,
+        max_tokens: int | None = None,
         on_complete: Callable[[str], Awaitable[None] | None] | None = None,
     ) -> AsyncIterator[str]:
         """Stream assistant tokens. Yields text deltas.
@@ -119,19 +120,20 @@ class OpenAICompatibleLLM:
         started_at = time.monotonic()
         first_token_logged = False
         prompt_chars = sum(len(str(msg.get("content", ""))) for msg in messages)
+        resolved_max_tokens = max_tokens or CFG.llm.max_tokens
         try:
             stream = await self._client.chat.completions.create(
                 model=CFG.llm.model,
                 messages=messages,
                 stream=True,
                 temperature=0.6,
-                max_tokens=CFG.llm.max_tokens,
+                max_tokens=resolved_max_tokens,
                 timeout=CFG.llm.request_timeout_s,
             )
             log.info(
                 "LLM stream created prompt_chars=%d max_tokens=%d setup_latency=%.2fs",
                 prompt_chars,
-                CFG.llm.max_tokens,
+                resolved_max_tokens,
                 time.monotonic() - started_at,
             )
             stream_iter = stream.__aiter__()

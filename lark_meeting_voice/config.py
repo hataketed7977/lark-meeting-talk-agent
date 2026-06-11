@@ -34,13 +34,13 @@ class FeishuConfig:
 
 @dataclass
 class ASRConfig:
-    backend: str = os.getenv("VOLC_ASR_BACKEND", "legacy")
+    backend: str = os.getenv("VOLC_ASR_BACKEND", "sdk")
     appid: str = os.getenv("VOLC_ASR_APPID", "")
     token: str = os.getenv("VOLC_ASR_TOKEN", "")
     cluster: str = os.getenv("VOLC_ASR_CLUSTER", "volcengine_streaming_common")
-    resource_id: str = os.getenv("VOLC_ASR_RESOURCE_ID", "volc.bigasr.sauc.duration")
+    resource_id: str = os.getenv("VOLC_ASR_RESOURCE_ID", "volc.seedasr.sauc.duration")
     ws_url: str = os.getenv(
-        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v2/asr"
+        "VOLC_ASR_WS_URL", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     )
     language: str = os.getenv("VOLC_ASR_LANGUAGE", "en-US")
     sample_rate: int = 16000
@@ -77,6 +77,7 @@ class LLMConfig:
     max_history_turns: int = int(os.getenv("LLM_MAX_HISTORY_TURNS", "8"))
     meeting_context_max_chars: int = int(os.getenv("MEETING_CONTEXT_MAX_CHARS", "2500"))
     max_tokens: int = int(os.getenv("LLM_MAX_TOKENS", "100"))
+    doc_route_max_tokens: int = int(os.getenv("LLM_DOC_ROUTE_MAX_TOKENS", "260"))
     request_timeout_s: float = float(os.getenv("LLM_REQUEST_TIMEOUT_S", "20"))
     stream_idle_timeout_s: float = float(os.getenv("LLM_STREAM_IDLE_TIMEOUT_S", "12"))
     tts_chunk_min_chars: int = int(os.getenv("LLM_TTS_CHUNK_MIN_CHARS", "12"))
@@ -134,10 +135,10 @@ class AgentConfig:
     )
     asr_soft_final_min_chars: int = int(os.getenv("ASR_SOFT_FINAL_MIN_CHARS", "8"))
     engaged_asr_soft_final_quiet_window_s: float = float(
-        os.getenv("ENGAGED_ASR_SOFT_FINAL_QUIET_WINDOW_S", "0.5")
+        os.getenv("ENGAGED_ASR_SOFT_FINAL_QUIET_WINDOW_S", "1.2")
     )
     engaged_asr_soft_final_min_chars: int = int(
-        os.getenv("ENGAGED_ASR_SOFT_FINAL_MIN_CHARS", "6")
+        os.getenv("ENGAGED_ASR_SOFT_FINAL_MIN_CHARS", "16")
     )
     memory_recent_utterances: int = int(os.getenv("MEMORY_RECENT_UTTERANCES", "50"))
     memory_summary_items: int = int(os.getenv("MEMORY_SUMMARY_ITEMS", "8"))
@@ -150,6 +151,20 @@ class AgentConfig:
         os.getenv("MEMORY_ROLLUP_SOURCE_MAX_CHARS", "5000")
     )
     memory_retrieval_max_items: int = int(os.getenv("MEMORY_RETRIEVAL_MAX_ITEMS", "6"))
+    summary_context_max_chars: int = int(os.getenv("SUMMARY_CONTEXT_MAX_CHARS", "1800"))
+    summary_context_summary_max_chars: int = int(
+        os.getenv("SUMMARY_CONTEXT_SUMMARY_MAX_CHARS", "800")
+    )
+    summary_context_facts_max_chars: int = int(
+        os.getenv("SUMMARY_CONTEXT_FACTS_MAX_CHARS", "700")
+    )
+    summary_context_artifact_max_chars: int = int(
+        os.getenv("SUMMARY_CONTEXT_ARTIFACT_MAX_CHARS", "700")
+    )
+    summary_context_retrieval_max_items: int = int(
+        os.getenv("SUMMARY_CONTEXT_RETRIEVAL_MAX_ITEMS", "3")
+    )
+    doc_context_max_chars: int = int(os.getenv("DOC_CONTEXT_MAX_CHARS", "2200"))
     reply_error_tts_text: str = os.getenv(
         "REPLY_ERROR_TTS_TEXT",
         "抱歉，我刚才没组织好回答，请再说一遍。",
@@ -160,10 +175,13 @@ class AgentConfig:
     )
     wake_ack_tts_text_en: str = os.getenv(
         "WAKE_ACK_TTS_TEXT_EN",
-        "I'm here. Go ahead.",
+        "I'm here. What can I help with?",
     )
     reconnect_attempts: int = int(os.getenv("AGENT_RECONNECT_ATTEMPTS", "3"))
     reconnect_backoff_s: float = float(os.getenv("AGENT_RECONNECT_BACKOFF_S", "2.0"))
+    startup_silent_downstream_fail_window_s: float = float(
+        os.getenv("STARTUP_SILENT_DOWNSTREAM_FAIL_WINDOW_S", "0")
+    )
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
 

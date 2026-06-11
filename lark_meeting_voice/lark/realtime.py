@@ -223,6 +223,9 @@ class RealtimeClient:
         log.warning("Closing realtime session due to recoverable error=%s", kind)
         await self.close(reason="CLIENT_ERROR")
 
+    async def fail_recoverably(self, kind: str) -> None:
+        await self._close_due_to_recoverable_error(kind)
+
     async def downstream(self) -> AsyncIterator[DownstreamAudio]:
         while not self._closed.is_set():
             try:
@@ -371,6 +374,7 @@ class RealtimeClient:
             self._closed.set()
         elif t == "error":
             err = ev.error
+            err_message_lower = err.message.lower()
             key = (err.code, err.message)
             count = self._err_seen.get(key, 0) + 1
             self._err_seen[key] = count
@@ -388,7 +392,11 @@ class RealtimeClient:
             # Highlight the "another process owns the publisher slot" case —
             # this means our audio.upstream.append frames are being silently
             # dropped and the bot will be inaudible in the meeting.
-            if count == 1 and err.code == 1001 and "stale stream publish session" in err.message:
+            if (
+                count == 1
+                and err.code == 1001
+                and "stale stream publish session" in err_message_lower
+            ):
                 log.critical(
                     "UPSTREAM PUBLISHER SLOT CONFLICT: another realtime session "
                     "already owns the publisher for this bot identity "
@@ -404,6 +412,19 @@ class RealtimeClient:
                     self._close_due_to_recoverable_error(
                         "stale_stream_publish_session"
                     )
+                )
+            elif (
+                count == 1
+                and err.code == 1001
+                and "reconnect in cooldown" in err_message_lower
+            ):
+                log.critical(
+                    "STREAM AGENT COOLDOWN: realtime session entered cooldown and "
+                    "will not recover in-place. Closing current session so the "
+                    "outer retry loop can rejoin cleanly."
+                )
+                asyncio.create_task(
+                    self._close_due_to_recoverable_error("stream_agent_cooldown")
                 )
         else:
             log.warning(

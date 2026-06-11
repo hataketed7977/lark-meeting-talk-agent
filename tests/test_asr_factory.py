@@ -24,14 +24,31 @@ def test_factory_falls_back_to_legacy_for_v2(monkeypatch):
     assert isinstance(backend, VolcASR)
 
 
-def test_build_sdk_request_payload_includes_language(monkeypatch):
+def test_build_sdk_request_payload_omits_language_for_v3_async(monkeypatch):
     monkeypatch.setattr(CFG.asr, "appid", "app")
     monkeypatch.setattr(CFG.asr, "token", "token")
     monkeypatch.setattr(CFG.asr, "cluster", "volcengine_streaming_common")
+    monkeypatch.setattr(
+        CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
+    )
+    monkeypatch.setattr(CFG.asr, "language", "en-US")
+
+    payload = _build_sdk_request_payload()
+
+    assert "language" not in payload["audio"]
+    assert payload["request"]["model_name"] == "bigmodel"
+
+
+def test_build_sdk_request_payload_includes_language_for_v3_nostream(monkeypatch):
+    monkeypatch.setattr(CFG.asr, "appid", "app")
+    monkeypatch.setattr(CFG.asr, "token", "token")
+    monkeypatch.setattr(CFG.asr, "cluster", "volcengine_streaming_common")
+    monkeypatch.setattr(
+        CFG.asr, "ws_url", "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_nostream"
+    )
     monkeypatch.setattr(CFG.asr, "language", "en-US")
 
     payload = _build_sdk_request_payload()
 
     assert payload["audio"]["language"] == "en-US"
-    assert payload["request"]["model_name"] == "bigmodel"
     assert "language" not in payload["request"]

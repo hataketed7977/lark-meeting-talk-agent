@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import ctypes
+import inspect
 import logging
 import os
 import signal
@@ -32,6 +33,7 @@ from lark_meeting_voice.lark.bot_join import (
     get_realtime_endpoint,
 )
 from lark_meeting_voice.lark.realtime import RealtimeClient
+from lark_meeting_voice.memory.meeting_memory import MeetingMemory
 
 
 def _setup_logging() -> None:
@@ -110,6 +112,14 @@ async def _run(
 
     max_attempts = max(1, CFG.agent.reconnect_attempts)
     backoff_s = max(0.0, CFG.agent.reconnect_backoff_s)
+    recoverable_leave_delays = {
+        "stale_stream_publish_session": 1.5,
+        "stream_agent_cooldown": 4.0,
+        "asr_session_failed": 2.0,
+        "startup_silent_downstream": 1.5,
+    }
+    retained_memory: MeetingMemory | None = None
+    retained_meeting_id: str | None = None
 
     for attempt in range(1, max_attempts + 1):
         rt: RealtimeClient | None = None
@@ -117,6 +127,7 @@ async def _run(
         orch_task: asyncio.Task | None = None
         current_meeting_id: str | None = None
         recoverable: str | None = None
+        should_retry = False
         try:
             resolved_ws_url, current_meeting_id = await _resolve_ws_url(
                 ws_url=ws_url,
@@ -128,7 +139,17 @@ async def _run(
             await rt.wait_session_created()
             logging.info("Realtime session ready; entering orchestrator loop")
 
-            orch = Orchestrator(rt, meeting_id=current_meeting_id)
+            reuse_memory = (
+                retained_memory
+                if retained_memory is not None
+                and retained_meeting_id
+                and retained_meeting_id == current_meeting_id
+                else None
+            )
+            orch_kwargs = {"meeting_id": current_meeting_id}
+            if "memory" in inspect.signature(Orchestrator).parameters:
+                orch_kwargs["memory"] = reuse_memory
+            orch = Orchestrator(rt, **orch_kwargs)
             orch_task = asyncio.create_task(orch.run(), name=f"orchestrator-{attempt}")
             stop_task = asyncio.create_task(
                 stop_evt.wait(), name=f"stop-wait-{attempt}"
@@ -160,6 +181,7 @@ async def _run(
             else:
                 recoverable = rt.recoverable_fatal_error if rt is not None else None
                 if recoverable:
+                    should_retry = recoverable in recoverable_leave_delays
                     logging.warning(
                         "Realtime session ended due to recoverable error=%s "
                         "on attempt %d/%d",
@@ -168,8 +190,9 @@ async def _run(
                         max_attempts,
                     )
                 else:
-                    logging.warning(
-                        "Realtime session ended unexpectedly on attempt %d/%d",
+                    logging.error(
+                        "Realtime session ended unexpectedly on attempt %d/%d; "
+                        "not auto-retrying to avoid churn",
                         attempt,
                         max_attempts,
                     )
@@ -186,6 +209,10 @@ async def _run(
                     "Non-retryable Lark API error code=%s; stop retrying", exc.code
                 )
                 return 1
+            should_retry = True
+            logging.warning(
+                "Setup failure is treated as transient; retrying if attempts remain"
+            )
         finally:
             if rt is not None:
                 await rt.close(reason="USER_LEFT")
@@ -195,14 +222,21 @@ async def _run(
                     await orch_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if recoverable in recoverable_leave_delays and orch is not None:
+                retained_memory = orch.memory
+                retained_meeting_id = current_meeting_id
+            elif recoverable is None:
+                retained_memory = None
+                retained_meeting_id = None
             if (
-                recoverable == "stale_stream_publish_session"
+                recoverable in recoverable_leave_delays
                 and meeting_no
                 and current_meeting_id
             ):
                 logging.warning(
-                    "Forcing bot leave after stale publish conflict before retry: "
+                    "Forcing bot leave after recoverable error=%s before retry: "
                     "meeting_id=%s",
+                    recoverable,
                     current_meeting_id,
                 )
                 try:
@@ -210,9 +244,13 @@ async def _run(
                 except Exception as exc:  # noqa: BLE001
                     logging.warning("Forced bot leave failed: %s", exc)
                 else:
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(recoverable_leave_delays[recoverable])
 
-        if stop_evt.is_set() or attempt >= max_attempts:
+        if stop_evt.is_set():
+            break
+        if not should_retry:
+            return 1
+        if attempt >= max_attempts:
             break
 
         delay = backoff_s * (2 ** (attempt - 1))

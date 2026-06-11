@@ -128,6 +128,23 @@ def _is_v3_ws_url(ws_url: str) -> bool:
     return "/api/v3/" in ws_url
 
 
+def _is_v3_nostream_ws_url(ws_url: str) -> bool:
+    return "/api/v3/" in ws_url and "bigmodel_nostream" in ws_url
+
+
+def _extract_response_headers(ws: Any) -> dict[str, str]:
+    headers = getattr(ws, "response_headers", None)
+    if headers is None:
+        response = getattr(ws, "response", None)
+        headers = getattr(response, "headers", None)
+    if headers is None:
+        return {}
+    try:
+        return {str(k): str(v) for k, v in headers.items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _as_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -169,7 +186,31 @@ def _normalize_asr_text(text: str) -> str:
 
 
 def _build_asr_start_request(req_id: str) -> dict[str, Any]:
-    audio: dict[str, Any] = {
+    if _is_v3_ws_url(CFG.asr.ws_url):
+        audio: dict[str, Any] = {
+            "format": "pcm",
+            "codec": "raw",
+            "rate": CFG.asr.sample_rate,
+            "bits": 16,
+            "channel": 1,
+        }
+        if CFG.asr.language and _is_v3_nostream_ws_url(CFG.asr.ws_url):
+            audio["language"] = CFG.asr.language
+        request: dict[str, Any] = {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "enable_punc": True,
+            "show_utterances": True,
+            "result_type": "single",
+            "end_window_size": 800,
+        }
+        return {
+            "user": {"uid": "lark_meeting_voice"},
+            "audio": audio,
+            "request": request,
+        }
+
+    audio = {
         "format": "pcm",
         "codec": "raw",
         "rate": CFG.asr.sample_rate,
@@ -178,24 +219,7 @@ def _build_asr_start_request(req_id: str) -> dict[str, Any]:
     }
     if CFG.asr.language:
         audio["language"] = CFG.asr.language
-
-    request: dict[str, Any]
-    if _is_v3_ws_url(CFG.asr.ws_url):
-        request = {
-            "model_name": "bigmodel",
-            "language": CFG.asr.language,
-            "enable_itn": True,
-            "enable_punc": True,
-            "enable_ddc": False,
-            "show_utterances": True,
-            "result_type": "single",
-            # Force sentence boundaries so the meeting bot receives final turns
-            # during an open-ended conversation instead of only at stream end.
-            "end_window_size": 800,
-            "force_to_speech_time": 1000,
-        }
-    else:
-        request = {
+    request = {
             "reqid": req_id,
             "nbest": 1,
             "workflow": "audio_in,resample,partition,vad,fe,decode,itn,nlu_punctuate",
@@ -203,8 +227,7 @@ def _build_asr_start_request(req_id: str) -> dict[str, Any]:
             "show_utterances": True,
             "result_type": "single",
             "sequence": 1,
-        }
-
+    }
     return {
         "app": {
             "appid": CFG.asr.appid,
@@ -237,23 +260,31 @@ class VolcASR:
         self._feed_count = 0
         self._recv_count = 0
         self._next_sequence = 1
+        self._request_id = ""
+        self._stop_lock = asyncio.Lock()
+        self._stop_started = False
+        self._final_frame_sent = False
 
     async def start(self) -> None:
-        headers = {
-            "Authorization": f"Bearer; {CFG.asr.token}",
-        }
         self._closed = asyncio.Event()
         req_id = str(uuid.uuid4())
+        self._request_id = req_id
         self._next_sequence = 1
+        self._stop_started = False
+        self._final_frame_sent = False
         if "/api/v3/" in CFG.asr.ws_url:
-            headers.update(
-                {
-                    "X-Api-App-Key": CFG.asr.appid,
-                    "X-Api-Access-Key": CFG.asr.token,
-                    "X-Api-Resource-Id": CFG.asr.resource_id,
-                    "X-Api-Connect-Id": req_id,
-                }
-            )
+            headers = {
+                "X-Api-App-Key": CFG.asr.appid,
+                "X-Api-Access-Key": CFG.asr.token,
+                "X-Api-Resource-Id": CFG.asr.resource_id,
+                "X-Api-Connect-Id": req_id,
+                "X-Api-Request-Id": req_id,
+                "X-Api-Sequence": "-1",
+            }
+        else:
+            headers = {
+                "Authorization": f"Bearer; {CFG.asr.token}",
+            }
         self._ws = await websockets.connect(
             CFG.asr.ws_url,
             additional_headers=headers,
@@ -263,6 +294,7 @@ class VolcASR:
             open_timeout=CFG.asr.connect_timeout_s,
             close_timeout=5,
         )
+        response_headers = _extract_response_headers(self._ws)
         config = _build_asr_start_request(req_id)
         payload = gzip.compress(json.dumps(config).encode("utf-8"))
         if _is_v3_ws_url(CFG.asr.ws_url):
@@ -285,15 +317,17 @@ class VolcASR:
             )
         self._recv_task = asyncio.create_task(self._recv_loop(), name="asr-recv")
         log.info(
-            "Volc ASR stream started req_id=%s endpoint=%s resource_id=%s language=%s",
+            "Volc ASR stream started req_id=%s endpoint=%s resource_id=%s language=%s logid=%s connect_id=%s",
             req_id,
             CFG.asr.ws_url,
             CFG.asr.resource_id,
             CFG.asr.language,
+            response_headers.get("X-Tt-Logid", ""),
+            response_headers.get("X-Api-Connect-Id", ""),
         )
 
     async def feed_pcm(self, pcm16k: bytes) -> None:
-        if not pcm16k or self._ws is None or self._closed.is_set():
+        if not pcm16k:
             return
         self._feed_count += 1
         if self._feed_count == 1 or self._feed_count % 100 == 0:
@@ -302,64 +336,92 @@ class VolcASR:
                 self._feed_count,
                 len(pcm16k),
             )
-        payload = gzip.compress(pcm16k)
-        if _is_v3_ws_url(CFG.asr.ws_url):
-            frame = (
-                _build_header(AUDIO_ONLY_REQUEST, flags=POS_SEQUENCE)
-                + struct.pack(">i", self._next_sequence)
-                + struct.pack(">I", len(payload))
-                + payload
-            )
-            self._next_sequence += 1
-        else:
-            frame = (
-                _build_header(AUDIO_ONLY_REQUEST)
-                + struct.pack(">I", len(payload))
-                + payload
-            )
         async with self._send_lock:
+            if self._closed.is_set() or self._ws is None:
+                return
+            payload = gzip.compress(pcm16k)
+            if _is_v3_ws_url(CFG.asr.ws_url):
+                frame = (
+                    _build_header(AUDIO_ONLY_REQUEST, flags=POS_SEQUENCE)
+                    + struct.pack(">i", self._next_sequence)
+                    + struct.pack(">I", len(payload))
+                    + payload
+                )
+                self._next_sequence += 1
+            else:
+                frame = (
+                    _build_header(AUDIO_ONLY_REQUEST)
+                    + struct.pack(">I", len(payload))
+                    + payload
+                )
             try:
                 await asyncio.wait_for(
                     self._ws.send(frame), timeout=CFG.asr.stream_idle_timeout_s
                 )
-            except (asyncio.TimeoutError, websockets.ConnectionClosed):
+            except asyncio.TimeoutError:
                 self._closed.set()
+                log.warning("ASR send timed out req_id=%s", self._request_id)
+                if self._on_error:
+                    await self._on_error("asr_send_failed")
+            except websockets.ConnectionClosed as exc:
+                self._closed.set()
+                log.warning(
+                    "ASR send failed on closed socket req_id=%s code=%s reason=%s",
+                    self._request_id,
+                    getattr(exc, "code", None),
+                    getattr(exc, "reason", ""),
+                )
                 if self._on_error:
                     await self._on_error("asr_send_failed")
 
     async def stop(self) -> None:
-        self._closed.set()
-        if self._ws is not None:
+        async with self._stop_lock:
+            if self._stop_started:
+                log.info("ASR stop already in progress req_id=%s", self._request_id)
+                return
+            self._stop_started = True
+            self._closed.set()
+            ws = self._ws
+            self._ws = None
+        if ws is not None:
             try:
-                # Send final empty audio with NEG flag to signal end.
-                if _is_v3_ws_url(CFG.asr.ws_url):
-                    final_seq = -self._next_sequence
-                    payload = b""
-                    b0 = (PROTOCOL_VERSION << 4) | DEFAULT_HEADER_SIZE
-                    b1 = (AUDIO_ONLY_REQUEST << 4) | NEG_WITH_SEQUENCE
-                    b2 = (SERIALIZATION_JSON << 4) | 0
-                    b3 = 0
-                    frame = (
-                        bytes([b0, b1, b2, b3])
-                        + struct.pack(">i", final_seq)
-                        + struct.pack(">I", len(payload))
-                        + payload
-                    )
-                else:
-                    payload = gzip.compress(b"")
-                    frame = (
-                        _build_header(AUDIO_ONLY_REQUEST, flags=NEG_SEQUENCE)
-                        + struct.pack(">I", len(payload))
-                        + payload
-                    )
                 async with self._send_lock:
-                    await self._ws.send(frame)
+                    if not self._final_frame_sent:
+                        # Send final empty audio with NEG flag to signal end.
+                        if _is_v3_ws_url(CFG.asr.ws_url):
+                            final_seq = -self._next_sequence
+                            payload = b""
+                            b0 = (PROTOCOL_VERSION << 4) | DEFAULT_HEADER_SIZE
+                            b1 = (AUDIO_ONLY_REQUEST << 4) | NEG_WITH_SEQUENCE
+                            b2 = (SERIALIZATION_JSON << 4) | 0
+                            b3 = 0
+                            frame = (
+                                bytes([b0, b1, b2, b3])
+                                + struct.pack(">i", final_seq)
+                                + struct.pack(">I", len(payload))
+                                + payload
+                            )
+                        else:
+                            payload = gzip.compress(b"")
+                            frame = (
+                                _build_header(AUDIO_ONLY_REQUEST, flags=NEG_SEQUENCE)
+                                + struct.pack(">I", len(payload))
+                                + payload
+                            )
+                        await ws.send(frame)
+                        self._final_frame_sent = True
             except Exception:  # noqa: BLE001
-                pass
+                log.exception("ASR final frame send failed req_id=%s", self._request_id)
             try:
-                await self._ws.close()
+                await ws.close()
+                log.info(
+                    "ASR websocket closed req_id=%s close_code=%s close_reason=%s",
+                    self._request_id,
+                    getattr(ws, "close_code", None),
+                    getattr(ws, "close_reason", ""),
+                )
             except Exception:  # noqa: BLE001
-                pass
+                log.exception("ASR websocket close failed req_id=%s", self._request_id)
         if self._recv_task:
             self._recv_task.cancel()
             try:
@@ -369,11 +431,12 @@ class VolcASR:
 
     async def _recv_loop(self) -> None:
         assert self._ws is not None
+        ws = self._ws
         try:
             while not self._closed.is_set():
                 try:
                     msg = await asyncio.wait_for(
-                        self._ws.recv(), timeout=CFG.asr.stream_idle_timeout_s
+                        ws.recv(), timeout=CFG.asr.stream_idle_timeout_s
                     )
                 except asyncio.TimeoutError:
                     # V3 ASR may stay quiet until speech arrives. The websocket
@@ -384,7 +447,13 @@ class VolcASR:
                         CFG.asr.stream_idle_timeout_s,
                     )
                     continue
-                except websockets.ConnectionClosed:
+                except websockets.ConnectionClosed as exc:
+                    log.warning(
+                        "ASR websocket recv closed req_id=%s code=%s reason=%s",
+                        self._request_id,
+                        getattr(exc, "code", None),
+                        getattr(exc, "reason", ""),
+                    )
                     break
                 if not isinstance(msg, (bytes, bytearray)):
                     continue

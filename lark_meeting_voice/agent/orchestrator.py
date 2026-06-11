@@ -41,6 +41,11 @@ from lark_meeting_voice.llm.openai_compatible import (
     OpenAICompatibleLLM,
     sentence_chunks,
 )
+from lark_meeting_voice.knowledge_routes import (
+    build_doc_context,
+    canonicalize_doc_query,
+    match_doc_route,
+)
 from lark_meeting_voice.memory.meeting_memory import MeetingMemory
 from lark_meeting_voice.tts.volc_tts import VolcTTS
 from lark_meeting_voice.wake.detector import WakeDetector
@@ -82,6 +87,24 @@ _LOW_VALUE_QUERY_WORDS = {
     "umm",
 }
 
+_SUMMARY_QUERY_PATTERNS = (
+    re.compile(
+        r"\b(summarize|summary|recap|wrap up|overview|takeaways?|minutes?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(action items?|next steps?|follow[- ]ups?|decisions?|risks?|blockers?|open questions?)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(evaluate|evaluation|how was|how did)\b.*\b(meeting|sharing|presentation|discussion|review)\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(总结|概括|回顾|复盘|这次会|这个会议|纪要|待办|行动项|结论|风险|问题)"
+    ),
+)
+
 
 def _is_low_value_query(text: str) -> bool:
     raw = " ".join((text or "").strip().split())
@@ -100,6 +123,13 @@ def _final_key(text: str) -> str:
     return " ".join((text or "").strip().lower().split())
 
 
+def _is_summary_query(text: str) -> bool:
+    cleaned = " ".join((text or "").strip().split())
+    if not cleaned:
+        return False
+    return any(pattern.search(cleaned) for pattern in _SUMMARY_QUERY_PATTERNS)
+
+
 class State(str, enum.Enum):
     WAITING = "waiting"
     ENGAGED = "engaged"
@@ -112,6 +142,7 @@ class Orchestrator:
         realtime: RealtimeClient,
         *,
         meeting_id: str | None = None,
+        memory: MeetingMemory | None = None,
     ) -> None:
         self._rt = realtime
         self._meeting_id = meeting_id
@@ -120,7 +151,7 @@ class Orchestrator:
         self._end_session = StopClassifier(CFG.agent.end_session_words)
         self._llm = OpenAICompatibleLLM()
         self._tts = VolcTTS()
-        self._memory = MeetingMemory(
+        self._memory = memory or MeetingMemory(
             max_recent_utterances=CFG.agent.memory_recent_utterances,
             max_summary_items=CFG.agent.memory_summary_items,
         )
@@ -162,6 +193,10 @@ class Orchestrator:
     @property
     def exit_reason(self) -> str | None:
         return self._exit_reason
+
+    @property
+    def memory(self) -> MeetingMemory:
+        return self._memory
 
     async def run(self) -> None:
         if self._meeting_id:
@@ -234,13 +269,42 @@ class Orchestrator:
         """Read 24 kHz PCM from Feishu -> downsample -> feed ASR."""
         assert self._asr is not None
         chunk_count = 0
+        startup_started_at = time.monotonic()
+        startup_audio_healthy = False
+        startup_fail_window_s = CFG.agent.startup_silent_downstream_fail_window_s
         try:
             async for audio in self._rt.downstream():
                 if not audio.pcm:
                     continue
                 chunk_count += 1
+                peak24k, rms24k = _pcm16_metrics(audio.pcm)
+                if not startup_audio_healthy and (peak24k > 0 or rms24k > 0):
+                    startup_audio_healthy = True
+                    log.info(
+                        "Downstream audio became healthy chunk_count=%d peak24k=%d rms24k=%d",
+                        chunk_count,
+                        peak24k,
+                        rms24k,
+                    )
+                if (
+                    not startup_audio_healthy
+                    and startup_fail_window_s > 0
+                    and time.monotonic() - startup_started_at >= startup_fail_window_s
+                ):
+                    log.warning(
+                        "Downstream audio stayed silent for %.1fs after startup "
+                        "chunk_count=%d peak24k=%d rms24k=%d -> forcing rebuild",
+                        startup_fail_window_s,
+                        chunk_count,
+                        peak24k,
+                        rms24k,
+                    )
+                    self._shutdown_requested.set()
+                    self._cancel_soft_final_task()
+                    self._clear_partial_tracking()
+                    await self._rt.fail_recoverably("startup_silent_downstream")
+                    return
                 if chunk_count == 1 or chunk_count % 100 == 0:
-                    peak24k, rms24k = _pcm16_metrics(audio.pcm)
                     log.info(
                         "Downstream pump chunk count=%d pcm24k_bytes=%d duration_ms=%d peak24k=%d rms24k=%d",
                         chunk_count,
@@ -393,6 +457,47 @@ class Orchestrator:
         except asyncio.CancelledError:
             raise
 
+    def _build_meeting_context(self, query: str) -> tuple[str, bool, str | None]:
+        doc_route = match_doc_route(query)
+        summary_mode = _is_summary_query(query)
+        if doc_route:
+            context = build_doc_context(
+                doc_route,
+                query=query,
+                max_chars=CFG.agent.doc_context_max_chars,
+            )
+        elif summary_mode:
+            context = self._memory.build_summary_context_block(
+                query,
+                max_chars=CFG.agent.summary_context_max_chars,
+                summary_max_chars=CFG.agent.summary_context_summary_max_chars,
+                facts_max_chars=CFG.agent.summary_context_facts_max_chars,
+                artifact_max_chars=CFG.agent.summary_context_artifact_max_chars,
+                retrieval_limit=CFG.agent.summary_context_retrieval_max_items,
+            )
+        else:
+            context = self._memory.build_context_block(
+                query,
+                recent_limit=CFG.agent.memory_context_recent_utterances,
+                retrieval_limit=CFG.agent.memory_retrieval_max_items,
+            )
+        ready_artifact_count = sum(
+            1
+            for artifact in self._memory.artifacts()
+            if artifact.fetch_status == "ready" and artifact.content
+        )
+        log.info(
+            "Reply context summary_mode=%s doc_route=%s context_chars=%d rolling_summary_chars=%d utterances=%d ready_artifacts=%d query=%r",
+            summary_mode,
+            doc_route,
+            len(context),
+            len(self._memory.rolling_summary),
+            self._memory.utterance_count,
+            ready_artifact_count,
+            query,
+        )
+        return context, summary_mode, doc_route
+
     async def _handle_final(self, text: str, *, source: str) -> None:
         text = " ".join((text or "").strip().split())
         if not text:
@@ -479,6 +584,16 @@ class Orchestrator:
 
     async def _on_asr_error(self, msg: str) -> None:
         log.warning("ASR error: %s", msg)
+        if msg == "asr_send_failed" or msg == "asr_error:45000000":
+            log.warning(
+                "ASR session entered a non-recovering state -> closing realtime "
+                "session so outer retry can rebuild"
+            )
+            self._shutdown_requested.set()
+            self._cancel_soft_final_task()
+            self._clear_partial_tracking()
+            await self._rt.fail_recoverably("asr_session_failed")
+            return
         if self._state == State.SPEAKING:
             log.warning("ASR failed during active reply -> abort reply")
             await self._abort_reply(next_state=State.ENGAGED)
@@ -695,14 +810,26 @@ class Orchestrator:
     async def _run_reply(self, query: str, cancel_event: asyncio.Event) -> None:
         log.info("Reply START query=%r", query)
         try:
-            token_stream = self._llm.stream(
+            meeting_context, summary_mode, doc_route = self._build_meeting_context(
+                query
+            )
+            log.info(
+                "Reply mode summary_mode=%s doc_route=%s query=%r",
+                summary_mode,
+                doc_route,
                 query,
+            )
+            effective_query = (
+                canonicalize_doc_query(doc_route, query) if doc_route else query
+            )
+            reply_max_tokens = (
+                CFG.llm.doc_route_max_tokens if doc_route else CFG.llm.max_tokens
+            )
+            token_stream = self._llm.stream(
+                effective_query,
                 cancel_event,
-                meeting_context=self._memory.build_context_block(
-                    query,
-                    recent_limit=CFG.agent.memory_context_recent_utterances,
-                    retrieval_limit=CFG.agent.memory_retrieval_max_items,
-                ),
+                meeting_context=meeting_context,
+                max_tokens=reply_max_tokens,
                 on_complete=self._remember_assistant_reply,
             )
             async for sentence in sentence_chunks(

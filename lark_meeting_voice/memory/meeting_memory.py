@@ -308,6 +308,69 @@ class MeetingMemory:
             return "Meeting memory snapshot:\n- No transcript has been captured yet."
         return "\n".join(parts)
 
+    def build_summary_context_block(
+        self,
+        query: str | None = None,
+        *,
+        max_chars: int = 1800,
+        summary_max_chars: int = 800,
+        facts_max_chars: int = 700,
+        artifact_max_chars: int = 700,
+        retrieval_limit: int = 3,
+    ) -> str:
+        chunks = [
+            "Meeting summary snapshot:",
+            f"- Total captured utterances: {len(self._all)}",
+        ]
+        used = len("\n".join(chunks))
+
+        def add_chunk(text: str, budget: int) -> None:
+            nonlocal used
+            cleaned = (text or "").strip()
+            if not cleaned or max_chars <= 0:
+                return
+            remaining = max_chars - used
+            if chunks:
+                remaining -= 1
+            if remaining <= 0:
+                return
+            allowed = min(budget, remaining) if budget > 0 else remaining
+            if allowed <= 0:
+                return
+            if len(cleaned) > allowed:
+                if allowed <= 3:
+                    return
+                cleaned = cleaned[: allowed - 3].rstrip() + "..."
+            if not cleaned:
+                return
+            chunks.append(cleaned)
+            used += len(cleaned) + 1
+
+        if self._rolling_summary:
+            add_chunk(
+                f"Rolling summary:\n{self._rolling_summary}",
+                summary_max_chars,
+            )
+        meta = self._meeting_meta_chunk()
+        if meta:
+            add_chunk(meta, 220)
+        facts = self._summary_facts_chunk()
+        if facts:
+            add_chunk(facts, facts_max_chars)
+        artifact_chunk = self._summary_artifact_chunk(artifact_max_chars)
+        if artifact_chunk:
+            add_chunk(artifact_chunk, artifact_max_chars)
+        evidence = self._retrieve_evidence(query or "", retrieval_limit)
+        if evidence:
+            evidence_chunk = "Relevant earlier transcript:\n" + "\n".join(
+                f"- {item.text}" for item in evidence
+            )
+            add_chunk(evidence_chunk, 320)
+
+        if len(chunks) == 2:
+            return "Meeting summary snapshot:\n- No transcript has been captured yet."
+        return "\n".join(chunks)
+
     def _retrieve_evidence(self, query: str, limit: int) -> list[MeetingUtterance]:
         if limit <= 0 or not query.strip() or not self._all:
             return []
@@ -329,8 +392,48 @@ class MeetingMemory:
         selected = sorted(scored[:limit], key=lambda row: row[1])
         return [item for _, _, item in selected]
 
-    def _artifact_excerpts(self) -> list[str]:
+    def _meeting_meta_chunk(self) -> str:
+        if not self._meeting_meta:
+            return ""
+        lines: list[str] = ["Current meeting event metadata:"]
+        if self._meeting_meta.get("topic"):
+            lines.append(f"- Topic: {self._meeting_meta['topic']}")
+        if self._meeting_meta.get("meeting_no"):
+            lines.append(f"- Meeting number: {self._meeting_meta['meeting_no']}")
+        if self._meeting_meta.get("start_time"):
+            lines.append(f"- Started at: {self._meeting_meta['start_time']}")
+        if self._meeting_meta.get("end_time"):
+            lines.append(f"- Ended at: {self._meeting_meta['end_time']}")
+        if len(lines) == 1:
+            return ""
+        return "\n".join(lines)
+
+    def _summary_facts_chunk(self) -> str:
+        snapshot = self.summary_snapshot()
         parts: list[str] = []
+        if snapshot["decisions"]:
+            parts.append("Decisions:")
+            parts.extend(f"- {item}" for item in snapshot["decisions"])
+        if snapshot["actions"]:
+            parts.append("Action items:")
+            parts.extend(f"- {item}" for item in snapshot["actions"])
+        if snapshot["risks"]:
+            parts.append("Risks / blockers:")
+            parts.extend(f"- {item}" for item in snapshot["risks"])
+        if snapshot["open_questions"]:
+            parts.append("Open questions:")
+            parts.extend(f"- {item}" for item in snapshot["open_questions"])
+        return "\n".join(parts)
+
+    def _summary_artifact_chunk(self, max_chars: int) -> str:
+        excerpts = self._artifact_excerpts(max_total_chars=max_chars)
+        if not excerpts:
+            return ""
+        return "Current meeting artifact excerpts:\n" + "\n".join(excerpts)
+
+    def _artifact_excerpts(self, max_total_chars: int | None = None) -> list[str]:
+        parts: list[str] = []
+        used = 0
         for artifact in self.artifacts():
             if artifact.fetch_status != "ready" or not artifact.content:
                 continue
@@ -339,7 +442,19 @@ class MeetingMemory:
             if len(artifact.content) > limit:
                 excerpt = excerpt.rstrip() + "..."
             title = f" ({artifact.title})" if artifact.title else ""
-            parts.append(f"- {artifact.kind}{title}: {excerpt}")
+            line = f"- {artifact.kind}{title}: {excerpt}"
+            if max_total_chars is not None and max_total_chars > 0:
+                remaining = max_total_chars - used
+                if parts:
+                    remaining -= 1
+                if remaining <= 0:
+                    break
+                if len(line) > remaining:
+                    if remaining <= 3:
+                        break
+                    line = line[: remaining - 3].rstrip() + "..."
+                used += len(line) + (1 if parts else 0)
+            parts.append(line)
         return parts
 
     def _find_artifact(self, kind: str, token: str) -> MeetingArtifact | None:

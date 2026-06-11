@@ -38,3 +38,35 @@ def test_stale_publish_conflict_triggers_recoverable_close():
         assert closed == {"reason": "CLIENT_ERROR"}
 
     asyncio.run(_run())
+
+
+def test_stream_agent_cooldown_triggers_recoverable_close():
+    async def _run() -> None:
+        client = RealtimeClient("wss://example.invalid/realtime")
+        closed = {}
+
+        async def fake_close(reason: str = "USER_LEFT") -> None:
+            closed["reason"] = reason
+            client._closed.set()  # type: ignore[attr-defined]
+
+        client.close = fake_close  # type: ignore[method-assign]
+
+        ev = mr.ServerEvent(
+            type="error",
+            event_id="evt-2",
+            session_id=123,
+            error=mr.Error(
+                client_event_id="client-2",
+                code=1001,
+                message="stream_agent reconnect in cooldown",
+                retryable=False,
+            ),
+        )
+
+        client._dispatch(ev)
+        await asyncio.sleep(0)
+
+        assert client.recoverable_fatal_error == "stream_agent_cooldown"
+        assert closed == {"reason": "CLIENT_ERROR"}
+
+    asyncio.run(_run())
